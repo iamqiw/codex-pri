@@ -1,0 +1,4 @@
+interface:
+  display_name: "Technical Solution Design"
+  short_description: "Draft secondary-development technical designs"
+  default_prompt: "Use $technical-solution-design to create a technical solution design from the requirement document and existing code."

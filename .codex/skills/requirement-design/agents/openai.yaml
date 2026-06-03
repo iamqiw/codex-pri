@@ -1,0 +1,4 @@
+interface:
+  display_name: "Requirement Design"
+  short_description: "Draft requirement designs grounded in code feasibility"
+  default_prompt: "Use $requirement-design to create a requirement design document grounded in current behavior and existing code."

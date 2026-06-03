@@ -1,0 +1,4 @@
+interface:
+  display_name: "Test Case Design"
+  short_description: "Draft test cases from requirements and design docs"
+  default_prompt: "Use $test-case-design to create test cases from the requirement document and technical solution design."

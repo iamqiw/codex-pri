@@ -1,6 +1,7 @@
 # Global project rules
 
 - Newly added non-source project content must be placed under `dev_harness/`.
+- When working under `dev_harness/`, also read and follow `dev_harness/AGENTS.md`.
 
 # Rust/codex-rs
 

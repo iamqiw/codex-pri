@@ -1,3 +1,7 @@
+# Global project rules
+
+- Newly added non-source project content must be placed under `dev_harness/`.
+
 # Rust/codex-rs
 
 In the codex-rs folder where the rust code lives:

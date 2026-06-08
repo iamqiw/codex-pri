@@ -80,6 +80,16 @@ pub struct ExecParams {
     #[serde(default)]
     pub pipe_stdin: bool,
     pub arg0: Option<String>,
+    #[serde(default)]
+    pub scratch_scope: Option<ExecScratchScope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecScratchScope {
+    pub caller_id: String,
+    pub thread_id: String,
+    pub request_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

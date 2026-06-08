@@ -806,6 +806,7 @@ mod tests {
                 tty: false,
                 pipe_stdin: false,
                 arg0: None,
+                scratch_scope: None,
             })
             .await
             .expect("start process");

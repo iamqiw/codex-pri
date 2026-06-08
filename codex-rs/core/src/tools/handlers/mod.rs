@@ -42,6 +42,8 @@ use serde_json::Map;
 use serde_json::Value;
 use std::path::Path;
 
+use crate::config::CloudRuntimeProfile;
+use crate::config::Config;
 use crate::function_tool::FunctionCallError;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
@@ -81,6 +83,14 @@ where
     serde_json::from_str(arguments).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to parse function arguments: {err}"))
     })
+}
+
+pub(crate) fn cloud_runtime_read_only_enabled(config: &Config) -> bool {
+    config.cloud_runtime.enabled
+        && matches!(
+            config.cloud_runtime.runtime_profile,
+            CloudRuntimeProfile::ReadOnly
+        )
 }
 
 fn updated_hook_command(updated_input: &Value) -> Result<&str, FunctionCallError> {

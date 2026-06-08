@@ -4,6 +4,7 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::agent_jobs_spec::create_spawn_agents_on_csv_tool;
+use crate::tools::handlers::cloud_runtime_read_only_enabled;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use codex_tools::ToolName;
@@ -66,6 +67,11 @@ pub async fn handle(
     turn: Arc<TurnContext>,
     arguments: String,
 ) -> Result<FunctionToolOutput, FunctionCallError> {
+    if cloud_runtime_read_only_enabled(&turn.config) {
+        return Err(FunctionCallError::RespondToModel(
+            "spawn_agents_on_csv is disabled for cloud runtime read-only profile".to_string(),
+        ));
+    }
     let args: SpawnAgentsOnCsvArgs = parse_arguments(arguments.as_str())?;
     if args.instruction.trim().is_empty() {
         return Err(FunctionCallError::RespondToModel(

@@ -19,6 +19,7 @@ use crate::outgoing_message::RequestContext;
 use crate::request_processors::AccountRequestProcessor;
 use crate::request_processors::AppsRequestProcessor;
 use crate::request_processors::CatalogRequestProcessor;
+use crate::request_processors::CloudWrapperRequestProcessor;
 use crate::request_processors::CommandExecRequestProcessor;
 use crate::request_processors::ConfigRequestProcessor;
 use crate::request_processors::EnvironmentRequestProcessor;
@@ -165,6 +166,7 @@ pub(crate) struct MessageProcessor {
     account_processor: AccountRequestProcessor,
     apps_processor: AppsRequestProcessor,
     catalog_processor: CatalogRequestProcessor,
+    cloud_wrapper_processor: CloudWrapperRequestProcessor,
     command_exec_processor: CommandExecRequestProcessor,
     process_exec_processor: ProcessExecRequestProcessor,
     config_processor: ConfigRequestProcessor,
@@ -372,6 +374,7 @@ impl MessageProcessor {
         let process_exec_processor = ProcessExecRequestProcessor::new(
             outgoing.clone(),
             Arc::clone(&environment_manager_for_requests),
+            Arc::clone(&config),
         );
         let feedback_processor = FeedbackRequestProcessor::new(
             auth_manager.clone(),
@@ -479,6 +482,7 @@ impl MessageProcessor {
         let fs_processor = FsRequestProcessor::new(
             Arc::clone(&environment_manager_for_requests),
             FsWatchManager::new(outgoing.clone()),
+            Arc::clone(&config),
         );
         let windows_sandbox_processor = WindowsSandboxRequestProcessor::new(
             outgoing.clone(),
@@ -492,6 +496,7 @@ impl MessageProcessor {
             account_processor,
             apps_processor,
             catalog_processor,
+            cloud_wrapper_processor: CloudWrapperRequestProcessor::new(&config),
             command_exec_processor,
             process_exec_processor,
             config_processor,
@@ -939,6 +944,55 @@ impl MessageProcessor {
                 .map(|response| Some(response.into())),
             ClientRequest::EnvironmentAdd { params, .. } => {
                 self.environment_processor.environment_add(params).await
+            }
+            ClientRequest::RequestRun { params, .. } => {
+                let caller_id = app_server_client_name.as_deref().unwrap_or("app-server");
+                self.cloud_wrapper_processor
+                    .request_run(caller_id, params)
+                    .await
+                    .map(|response| Some(response.into()))
+            }
+            ClientRequest::RequestRead { params, .. } => {
+                let caller_id = app_server_client_name.as_deref().unwrap_or("app-server");
+                self.cloud_wrapper_processor
+                    .request_read(caller_id, params)
+                    .await
+                    .map(|response| Some(response.into()))
+            }
+            ClientRequest::RequestCancel { params, .. } => {
+                let caller_id = app_server_client_name.as_deref().unwrap_or("app-server");
+                self.cloud_wrapper_processor
+                    .request_cancel(caller_id, params)
+                    .await
+                    .map(|response| Some(response.into()))
+            }
+            ClientRequest::RequestTerminal { params, .. } => {
+                let caller_id = app_server_client_name.as_deref().unwrap_or("app-server");
+                self.cloud_wrapper_processor
+                    .request_terminal(caller_id, params)
+                    .await
+                    .map(|response| Some(response.into()))
+            }
+            ClientRequest::RequestEventsList { params, .. } => {
+                let caller_id = app_server_client_name.as_deref().unwrap_or("app-server");
+                self.cloud_wrapper_processor
+                    .request_events_list(caller_id, params)
+                    .await
+                    .map(|response| Some(response.into()))
+            }
+            ClientRequest::ThreadAppendWithLease { params, .. } => {
+                let caller_id = app_server_client_name.as_deref().unwrap_or("app-server");
+                self.cloud_wrapper_processor
+                    .thread_append_with_lease(caller_id, params)
+                    .await
+                    .map(|response| Some(response.into()))
+            }
+            ClientRequest::ThreadItemsList { params, .. } => {
+                let caller_id = app_server_client_name.as_deref().unwrap_or("app-server");
+                self.cloud_wrapper_processor
+                    .thread_items_list(caller_id, params)
+                    .await
+                    .map(|response| Some(response.into()))
             }
             ClientRequest::FsReadFile { params, .. } => self
                 .fs_processor

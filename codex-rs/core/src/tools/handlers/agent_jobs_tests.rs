@@ -1,6 +1,9 @@
 use super::*;
+use crate::config::CloudRuntimeConfig;
+use crate::session::tests::make_session_and_context;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::sync::Arc;
 
 #[test]
 fn parse_csv_supports_quotes_and_commas() {
@@ -58,5 +61,37 @@ fn ensure_unique_headers_rejects_duplicates() {
     assert_eq!(
         err,
         FunctionCallError::RespondToModel("csv header path is duplicated".to_string())
+    );
+}
+
+#[tokio::test]
+async fn cloud_runtime_read_only_rejects_spawn_agents_on_csv() {
+    let (session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config.cloud_runtime = CloudRuntimeConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    turn.config = Arc::new(config);
+
+    let Err(err) = spawn_agents_on_csv::handle(
+        Arc::new(session),
+        Arc::new(turn),
+        json!({
+            "csv_path": "missing.csv",
+            "instruction": "work"
+        })
+        .to_string(),
+    )
+    .await
+    else {
+        panic!("spawn_agents_on_csv should be disabled");
+    };
+
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(
+            "spawn_agents_on_csv is disabled for cloud runtime read-only profile".to_string(),
+        )
     );
 }

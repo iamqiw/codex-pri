@@ -3786,8 +3786,8 @@
         "environmentId": {
           "default": null,
           "type": [
-            "null",
-            "string"
+            "string",
+            "null"
           ]
         },
         "itemId": {
@@ -6308,6 +6308,17 @@
         "type": "object"
       },
       "AppToolsConfig": {
+        "type": "object"
+      },
+      "AppendThreadItem": {
+        "properties": {
+          "payloadRef": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "payloadRef"
+        ],
         "type": "object"
       },
       "ApprovalsReviewer": {
@@ -13762,6 +13773,31 @@
         "title": "RemoteControlStatusChangedNotification",
         "type": "object"
       },
+      "RequestEvent": {
+        "properties": {
+          "eventType": {
+            "type": "string"
+          },
+          "payloadInline": {
+            "type": "string"
+          },
+          "requestId": {
+            "type": "string"
+          },
+          "sequence": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "eventType",
+          "payloadInline",
+          "requestId",
+          "sequence"
+        ],
+        "type": "object"
+      },
       "RequestId": {
         "anyOf": [
           {
@@ -13798,6 +13834,52 @@
           }
         },
         "type": "object"
+      },
+      "RequestRecord": {
+        "properties": {
+          "latestEventCursor": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "requestId": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/definitions/v2/RequestStatus"
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "latestEventCursor",
+          "requestId",
+          "status",
+          "threadId"
+        ],
+        "type": "object"
+      },
+      "RequestStatus": {
+        "enum": [
+          "queued",
+          "running",
+          "cancelling",
+          "completed",
+          "failed",
+          "cancelled",
+          "interrupted",
+          "owner_timed_out",
+          "lease_lost",
+          "turn_timed_out"
+        ],
+        "type": "string"
       },
       "ResidencyRequirement": {
         "enum": [
@@ -15438,6 +15520,19 @@
         "title": "TerminalInteractionNotification",
         "type": "object"
       },
+      "TerminalSignal": {
+        "enum": [
+          "cancel_confirmed",
+          "runtime_write_denied",
+          "writer_lease_lost",
+          "owner_lease_timed_out",
+          "turn_timed_out",
+          "interrupted",
+          "failed",
+          "completed"
+        ],
+        "type": "string"
+      },
       "TextElement": {
         "properties": {
           "byteRange": {
@@ -16805,6 +16900,27 @@
             "type": "object"
           }
         ]
+      },
+      "ThreadItemRecord": {
+        "properties": {
+          "payloadRef": {
+            "type": "string"
+          },
+          "sequence": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "payloadRef",
+          "sequence",
+          "threadId"
+        ],
+        "type": "object"
       },
       "ThreadListCwdFilter": {
         "anyOf": [
@@ -19234,6 +19350,27 @@
           "okOverridden"
         ],
         "type": "string"
+      },
+      "WriterLeaseRecord": {
+        "properties": {
+          "fencingToken": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "leaseId": {
+            "type": "string"
+          },
+          "writerOwnerToken": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "fencingToken",
+          "leaseId",
+          "writerOwnerToken"
+        ],
+        "type": "object"
       }
     }
   },

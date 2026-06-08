@@ -160,6 +160,7 @@ fn exec_server_params_for_request(
         tty,
         pipe_stdin: false,
         arg0: request.arg0.clone(),
+        scratch_scope: None,
     }
 }
 

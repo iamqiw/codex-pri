@@ -1,5 +1,7 @@
 use crate::agents_md::DEFAULT_AGENTS_MD_FILENAME;
 use crate::agents_md::LOCAL_AGENTS_MD_FILENAME;
+use crate::config::CloudRuntimeProfile;
+use crate::config::CloudRuntimeStateStore;
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
 use crate::config::edit::apply_blocking;
@@ -3570,6 +3572,63 @@ async fn runtime_config_resolves_session_picker_view_default_and_override() {
         cfg.tui_session_picker_view,
         SessionPickerViewMode::Comfortable
     );
+}
+
+#[tokio::test]
+async fn cloud_runtime_config_resolves_read_only_profile() {
+    let cfg: ConfigToml = toml::from_str(
+        r#"[cloud_runtime]
+enabled = true
+runtime_profile = "read_only"
+state_store = "mysql"
+mysql_url_env_var = "CODEX_CLOUD_STATE_MYSQL_URL"
+mysql_max_connections = 7
+"#,
+    )
+    .expect("deserialize cloud runtime config");
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .expect("load cloud runtime config");
+
+    assert!(config.cloud_runtime.enabled);
+    assert_eq!(
+        config.cloud_runtime.runtime_profile,
+        CloudRuntimeProfile::ReadOnly
+    );
+    assert_eq!(
+        config.cloud_runtime.state_store,
+        CloudRuntimeStateStore::Mysql
+    );
+    assert_eq!(
+        config.cloud_runtime.mysql_url_env_var.as_deref(),
+        Some("CODEX_CLOUD_STATE_MYSQL_URL")
+    );
+    assert_eq!(config.cloud_runtime.mysql_max_connections, 7);
+}
+
+#[tokio::test]
+async fn cloud_runtime_config_defaults_mysql_max_connections_to_design_value() {
+    let cfg: ConfigToml = toml::from_str(
+        r#"[cloud_runtime]
+enabled = true
+runtime_profile = "read_only"
+state_store = "mysql"
+"#,
+    )
+    .expect("deserialize cloud runtime config");
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .expect("load cloud runtime config");
+
+    assert_eq!(config.cloud_runtime.mysql_max_connections, 20);
 }
 
 #[tokio::test]

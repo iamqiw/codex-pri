@@ -43,6 +43,7 @@ mod realtime_conversation;
 mod remote_control;
 #[cfg(debug_assertions)]
 mod remote_thread_store;
+mod request_cloud_wrapper;
 mod request_permissions;
 mod request_user_input;
 mod review;

@@ -882,6 +882,48 @@ client_request_definitions! {
         serialization: global("environment"),
         response: v2::EnvironmentAddResponse,
     },
+    #[experimental("request/run")]
+    RequestRun => "request/run" {
+        params: v2::RequestRunParams,
+        serialization: global("cloud-wrapper"),
+        response: v2::RequestRunResponse,
+    },
+    #[experimental("request/read")]
+    RequestRead => "request/read" {
+        params: v2::RequestReadParams,
+        serialization: global("cloud-wrapper"),
+        response: v2::RequestReadResponse,
+    },
+    #[experimental("request/cancel")]
+    RequestCancel => "request/cancel" {
+        params: v2::RequestCancelParams,
+        serialization: global("cloud-wrapper"),
+        response: v2::RequestCancelResponse,
+    },
+    #[experimental("request/terminal")]
+    RequestTerminal => "request/terminal" {
+        params: v2::RequestTerminalParams,
+        serialization: global("cloud-wrapper"),
+        response: v2::RequestTerminalResponse,
+    },
+    #[experimental("request/events/list")]
+    RequestEventsList => "request/events/list" {
+        params: v2::RequestEventsListParams,
+        serialization: global("cloud-wrapper"),
+        response: v2::RequestEventsListResponse,
+    },
+    #[experimental("thread/appendWithLease")]
+    ThreadAppendWithLease => "thread/appendWithLease" {
+        params: v2::AppendThreadItemsWithLeaseParams,
+        serialization: global("cloud-wrapper"),
+        response: v2::AppendThreadItemsWithLeaseResponse,
+    },
+    #[experimental("thread/items/list")]
+    ThreadItemsList => "thread/items/list" {
+        params: v2::ThreadItemsListParams,
+        serialization: global("cloud-wrapper"),
+        response: v2::ThreadItemsListResponse,
+    },
 
     McpServerOauthLogin => "mcpServer/oauth/login" {
         params: v2::McpServerOauthLoginParams,
@@ -1590,6 +1632,7 @@ client_notification_definitions! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::experimental_api::ExperimentalApi;
     use anyhow::Result;
     use codex_protocol::ThreadId;
     use codex_protocol::account::PlanType;
@@ -1909,6 +1952,55 @@ mod tests {
         assert_eq!(
             environment_add.serialization_scope(),
             Some(ClientRequestSerializationScope::Global("environment"))
+        );
+
+        let request_run = ClientRequest::RequestRun {
+            request_id: request_id(),
+            params: v2::RequestRunParams {
+                thread_id: None,
+                create_thread: Some(true),
+                input: "sha256:input-1".to_string(),
+                idempotency_key: "idem-1".to_string(),
+                cwd: None,
+                client_info: None,
+            },
+        };
+        assert_eq!(
+            request_run.serialization_scope(),
+            Some(ClientRequestSerializationScope::Global("cloud-wrapper"))
+        );
+
+        let thread_append_with_lease = ClientRequest::ThreadAppendWithLease {
+            request_id: request_id(),
+            params: v2::AppendThreadItemsWithLeaseParams {
+                thread_id: "thread-1".to_string(),
+                request_id: "request-1".to_string(),
+                lease_id: "lease-1".to_string(),
+                writer_owner_token: "owner-token".to_string(),
+                fencing_token: 7,
+                append_idempotency_key: "append-1".to_string(),
+                expected_thread_version: Some(0),
+                items: vec![v2::AppendThreadItem {
+                    payload_ref: "object://items/1".to_string(),
+                }],
+            },
+        };
+        assert_eq!(
+            thread_append_with_lease.serialization_scope(),
+            Some(ClientRequestSerializationScope::Global("cloud-wrapper"))
+        );
+
+        let thread_items_list = ClientRequest::ThreadItemsList {
+            request_id: request_id(),
+            params: v2::ThreadItemsListParams {
+                thread_id: "thread-1".to_string(),
+                cursor: None,
+                limit: None,
+            },
+        };
+        assert_eq!(
+            thread_items_list.serialization_scope(),
+            Some(ClientRequestSerializationScope::Global("cloud-wrapper"))
         );
     }
 
@@ -2364,6 +2456,118 @@ mod tests {
             json!({
                 "method": "account/rateLimits/read",
                 "id": 1,
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_request_run_client_request() -> Result<()> {
+        let request = ClientRequest::RequestRun {
+            request_id: RequestId::Integer(1),
+            params: v2::RequestRunParams {
+                thread_id: Some("thread-1".to_string()),
+                create_thread: None,
+                input: "sha256:input-1".to_string(),
+                idempotency_key: "idem-1".to_string(),
+                cwd: Some("/workspace".to_string()),
+                client_info: Some("integration-test".to_string()),
+            },
+        };
+
+        assert_eq!(request.id(), &RequestId::Integer(1));
+        assert_eq!(request.method(), "request/run");
+        assert_eq!(request.experimental_reason(), Some("request/run"));
+        assert_eq!(
+            json!({
+                "method": "request/run",
+                "id": 1,
+                "params": {
+                    "threadId": "thread-1",
+                    "createThread": null,
+                    "input": "sha256:input-1",
+                    "idempotencyKey": "idem-1",
+                    "cwd": "/workspace",
+                    "clientInfo": "integration-test"
+                }
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_thread_append_with_lease_client_request() -> Result<()> {
+        let request = ClientRequest::ThreadAppendWithLease {
+            request_id: RequestId::Integer(1),
+            params: v2::AppendThreadItemsWithLeaseParams {
+                thread_id: "thread-1".to_string(),
+                request_id: "request-1".to_string(),
+                lease_id: "lease-1".to_string(),
+                writer_owner_token: "owner-token".to_string(),
+                fencing_token: 7,
+                append_idempotency_key: "append-1".to_string(),
+                expected_thread_version: Some(0),
+                items: vec![v2::AppendThreadItem {
+                    payload_ref: "object://items/1".to_string(),
+                }],
+            },
+        };
+
+        assert_eq!(request.id(), &RequestId::Integer(1));
+        assert_eq!(request.method(), "thread/appendWithLease");
+        assert_eq!(
+            request.experimental_reason(),
+            Some("thread/appendWithLease")
+        );
+        assert_eq!(
+            json!({
+                "method": "thread/appendWithLease",
+                "id": 1,
+                "params": {
+                    "threadId": "thread-1",
+                    "requestId": "request-1",
+                    "leaseId": "lease-1",
+                    "writerOwnerToken": "owner-token",
+                    "fencingToken": 7,
+                    "appendIdempotencyKey": "append-1",
+                    "expectedThreadVersion": 0,
+                    "items": [
+                        {
+                            "payloadRef": "object://items/1",
+                        }
+                    ],
+                }
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_thread_items_list_client_request() -> Result<()> {
+        let request = ClientRequest::ThreadItemsList {
+            request_id: RequestId::Integer(1),
+            params: v2::ThreadItemsListParams {
+                thread_id: "thread-1".to_string(),
+                cursor: Some(2),
+                limit: Some(50),
+            },
+        };
+
+        assert_eq!(request.id(), &RequestId::Integer(1));
+        assert_eq!(request.method(), "thread/items/list");
+        assert_eq!(request.experimental_reason(), Some("thread/items/list"));
+        assert_eq!(
+            json!({
+                "method": "thread/items/list",
+                "id": 1,
+                "params": {
+                    "threadId": "thread-1",
+                    "cursor": 2,
+                    "limit": 50,
+                }
             }),
             serde_json::to_value(&request)?,
         );

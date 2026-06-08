@@ -20,6 +20,8 @@ use codex_app_server_protocol::ProcessTerminalSize;
 use codex_app_server_protocol::ProcessWriteStdinParams;
 use codex_app_server_protocol::ProcessWriteStdinResponse;
 use codex_app_server_protocol::ServerNotification;
+use codex_core::config::CloudRuntimeProfile;
+use codex_core::config::Config;
 use codex_core::exec::ExecExpiration;
 use codex_core::exec::ExecExpirationOutcome;
 use codex_core::exec::IO_DRAIN_TIMEOUT_MS;
@@ -50,6 +52,7 @@ const OUTPUT_CHUNK_SIZE_HINT: usize = 64 * 1024;
 pub(crate) struct ProcessExecRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     environment_manager: Arc<EnvironmentManager>,
+    config: Arc<Config>,
     process_exec_manager: ProcessExecManager,
 }
 
@@ -57,10 +60,12 @@ impl ProcessExecRequestProcessor {
     pub(crate) fn new(
         outgoing: Arc<OutgoingMessageSender>,
         environment_manager: Arc<EnvironmentManager>,
+        config: Arc<Config>,
     ) -> Self {
         Self {
             outgoing,
             environment_manager,
+            config,
             process_exec_manager: ProcessExecManager::default(),
         }
     }
@@ -70,6 +75,7 @@ impl ProcessExecRequestProcessor {
         request_id: ConnectionRequestId,
         params: ProcessSpawnParams,
     ) -> Result<(), JSONRPCErrorError> {
+        self.require_process_spawn_enabled()?;
         self.require_local_environment()?;
         let ProcessSpawnParams {
             command,
@@ -187,6 +193,20 @@ impl ProcessExecRequestProcessor {
             .is_some()
             .then_some(())
             .ok_or_else(|| internal_error("local environment is not configured"))
+    }
+
+    fn require_process_spawn_enabled(&self) -> Result<(), JSONRPCErrorError> {
+        if self.config.cloud_runtime.enabled
+            && matches!(
+                self.config.cloud_runtime.runtime_profile,
+                CloudRuntimeProfile::ReadOnly
+            )
+        {
+            return Err(internal_error(
+                "process/spawn is disabled for cloud runtime read-only profile",
+            ));
+        }
+        Ok(())
     }
 }
 

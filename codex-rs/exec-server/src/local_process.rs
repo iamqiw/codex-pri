@@ -22,6 +22,8 @@ use crate::ExecProcessEvent;
 use crate::ExecProcessEventReceiver;
 use crate::ExecServerError;
 use crate::ProcessId;
+use crate::ReadOnlyScratchManager;
+use crate::ReadOnlyScratchScope;
 use crate::StartedExecProcess;
 use crate::process::ExecProcessEventLog;
 use crate::protocol::EXEC_CLOSED_METHOD;
@@ -32,6 +34,7 @@ use crate::protocol::ExecOutputDeltaNotification;
 use crate::protocol::ExecOutputStream;
 use crate::protocol::ExecParams;
 use crate::protocol::ExecResponse;
+use crate::protocol::ExecScratchScope;
 use crate::protocol::ProcessOutputChunk;
 use crate::protocol::ReadParams;
 use crate::protocol::ReadResponse;
@@ -40,6 +43,8 @@ use crate::protocol::TerminateResponse;
 use crate::protocol::WriteParams;
 use crate::protocol::WriteResponse;
 use crate::protocol::WriteStatus;
+use crate::read_only_scratch::READ_ONLY_SCRATCH_DIR_ENV_VAR;
+use crate::read_only_scratch::ReadOnlyScratch;
 use crate::rpc::RpcNotificationSender;
 use crate::rpc::RpcServerOutboundMessage;
 use crate::rpc::internal_error;
@@ -74,6 +79,7 @@ struct RunningProcess {
     output_notify: Arc<Notify>,
     open_streams: usize,
     closed: bool,
+    _scratch: Option<ReadOnlyScratch>,
 }
 
 enum ProcessEntry {
@@ -84,6 +90,7 @@ enum ProcessEntry {
 struct Inner {
     notifications: std::sync::RwLock<Option<RpcNotificationSender>>,
     processes: Mutex<HashMap<ProcessId, ProcessEntry>>,
+    scratch_manager: Option<ReadOnlyScratchManager>,
 }
 
 #[derive(Clone)]
@@ -113,6 +120,21 @@ impl LocalProcess {
             inner: Arc::new(Inner {
                 notifications: std::sync::RwLock::new(Some(notifications)),
                 processes: Mutex::new(HashMap::new()),
+                scratch_manager: None,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_read_only_scratch_manager(
+        notifications: RpcNotificationSender,
+        scratch_manager: ReadOnlyScratchManager,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                notifications: std::sync::RwLock::new(Some(notifications)),
+                processes: Mutex::new(HashMap::new()),
+                scratch_manager: Some(scratch_manager),
             }),
         }
     }
@@ -162,7 +184,14 @@ impl LocalProcess {
             process_map.insert(process_id.clone(), ProcessEntry::Starting);
         }
 
-        let env = child_env(&params);
+        let scratch = self.create_scratch(process_id.as_str(), params.scratch_scope.as_ref())?;
+        let mut env = child_env(&params);
+        if let Some(scratch) = &scratch {
+            env.insert(
+                READ_ONLY_SCRATCH_DIR_ENV_VAR.to_string(),
+                scratch.path().display().to_string(),
+            );
+        }
         let spawned_result = if params.tty {
             codex_utils_pty::spawn_pty_process(
                 program,
@@ -226,6 +255,7 @@ impl LocalProcess {
                     output_notify: Arc::clone(&output_notify),
                     open_streams: 2,
                     closed: false,
+                    _scratch: scratch,
                 })),
             );
         }
@@ -266,6 +296,28 @@ impl LocalProcess {
         self.start_process(params)
             .await
             .map(|(response, _, _)| response)
+    }
+
+    fn create_scratch(
+        &self,
+        process_id: &str,
+        scope: Option<&ExecScratchScope>,
+    ) -> Result<Option<ReadOnlyScratch>, JSONRPCErrorError> {
+        let Some(scope) = scope else {
+            return Ok(None);
+        };
+        let Some(scratch_manager) = &self.inner.scratch_manager else {
+            return Ok(None);
+        };
+        scratch_manager
+            .create(ReadOnlyScratchScope {
+                caller_id: scope.caller_id.clone(),
+                thread_id: scope.thread_id.clone(),
+                request_id: scope.request_id.clone(),
+                exec_id: process_id.to_string(),
+            })
+            .map(Some)
+            .map_err(|err| internal_error(format!("failed to create read-only scratch: {err}")))
     }
 
     pub(crate) async fn exec_read(
@@ -709,6 +761,7 @@ mod tests {
     use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
     use codex_utils_pty::ProcessDriver;
     use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
     use tokio::sync::oneshot;
     use tokio::time::timeout;
 
@@ -722,6 +775,7 @@ mod tests {
             tty: false,
             pipe_stdin: false,
             arg0: None,
+            scratch_scope: None,
         }
     }
 
@@ -845,6 +899,78 @@ mod tests {
         backend.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn process_start_injects_scoped_scratch_and_cleans_it_after_close() {
+        let root = TempDir::new().expect("scratch root");
+        let backend = LocalProcess::new_with_read_only_scratch_manager(
+            notification_sink(),
+            ReadOnlyScratchManager::new(crate::ReadOnlyScratchConfig {
+                root: root.path().join("scratch"),
+                max_bytes: 1024,
+                max_files: 8,
+            }),
+        );
+        let process_id = ProcessId::from("scratch-proc");
+        backend
+            .exec(ExecParams {
+                process_id: process_id.clone(),
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    format!(
+                        "printf '%s\\n' \"${}\"; printf data > \"${}/tool.tmp\"",
+                        READ_ONLY_SCRATCH_DIR_ENV_VAR, READ_ONLY_SCRATCH_DIR_ENV_VAR
+                    ),
+                ],
+                cwd: std::path::PathBuf::from("/tmp"),
+                env_policy: None,
+                env: HashMap::new(),
+                tty: false,
+                pipe_stdin: false,
+                arg0: None,
+                scratch_scope: Some(ExecScratchScope {
+                    caller_id: "caller/../raw user input".to_string(),
+                    thread_id: "thread-1".to_string(),
+                    request_id: "request-1".to_string(),
+                }),
+            })
+            .await
+            .expect("start process with scratch");
+
+        let response = read_process_until_change(&backend, &process_id, /*after_seq*/ None).await;
+        let scratch_path = String::from_utf8(
+            response
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.chunk.0.clone())
+                .collect::<Vec<_>>(),
+        )
+        .expect("scratch path output")
+        .trim()
+        .to_string();
+        let scratch_path = std::path::PathBuf::from(scratch_path);
+
+        let canonical_scratch_path = std::fs::canonicalize(&scratch_path).expect("scratch path");
+        let canonical_root =
+            std::fs::canonicalize(root.path().join("scratch")).expect("scratch root");
+        assert!(canonical_scratch_path.starts_with(canonical_root));
+        assert!(!scratch_path.to_string_lossy().contains(".."));
+        assert!(scratch_path.join("tool.tmp").exists());
+
+        let _closed_response = read_process_until_closed(&backend, &process_id).await;
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if !scratch_path.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("scratch should be removed after process eviction");
+        backend.shutdown().await;
+    }
+
     struct TestProcess {
         process_id: ProcessId,
         stdout_tx: mpsc::Sender<Vec<u8>>,
@@ -890,6 +1016,7 @@ mod tests {
                 output_notify: Arc::clone(&output_notify),
                 open_streams: 2,
                 closed: false,
+                _scratch: None,
             })),
         );
         assert!(previous.is_none());
@@ -940,6 +1067,13 @@ mod tests {
             resizer: None,
         })
         .session
+    }
+
+    fn notification_sink() -> RpcNotificationSender {
+        let (outgoing_tx, mut outgoing_rx) =
+            mpsc::channel::<RpcServerOutboundMessage>(NOTIFICATION_CHANNEL_CAPACITY);
+        tokio::spawn(async move { while outgoing_rx.recv().await.is_some() {} });
+        RpcNotificationSender::new(outgoing_tx)
     }
 
     async fn read_process_until_change(

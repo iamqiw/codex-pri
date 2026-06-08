@@ -30,6 +30,7 @@ use codex_tools::ToolSpec;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
+use crate::config::CloudRuntimeConfig;
 use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
@@ -616,6 +617,45 @@ async fn environment_count_controls_environment_backed_tools() {
         multiple_environments.visible_spec("view_image"),
         "environment_id"
     ));
+}
+
+#[tokio::test]
+async fn cloud_runtime_read_only_hides_write_and_subagent_tools() {
+    let plan = probe(|turn| {
+        turn.model_info.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        set_feature(turn, Feature::SpawnCsv, /*enabled*/ true);
+        update_config(turn, |config| {
+            config.cloud_runtime = CloudRuntimeConfig {
+                enabled: true,
+                ..Default::default()
+            };
+        });
+    })
+    .await;
+
+    plan.assert_visible_lacks(&[
+        "apply_patch",
+        "spawn_agent",
+        "send_message",
+        "followup_task",
+        "wait_agent",
+        "close_agent",
+        "list_agents",
+        "spawn_agents_on_csv",
+        "report_agent_job_result",
+    ]);
+    plan.assert_registered_lacks(&[
+        "apply_patch",
+        "spawn_agent",
+        "send_message",
+        "followup_task",
+        "wait_agent",
+        "close_agent",
+        "list_agents",
+        "spawn_agents_on_csv",
+        "report_agent_job_result",
+    ]);
 }
 
 #[tokio::test]

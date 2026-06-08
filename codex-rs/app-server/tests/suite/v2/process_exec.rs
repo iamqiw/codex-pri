@@ -131,6 +131,48 @@ async fn process_spawn_returns_error_when_local_environment_is_disabled() -> Res
 }
 
 #[tokio::test]
+async fn cloud_runtime_process_spawn_is_rejected_without_local_fallback() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    insert_process_exec_config(
+        codex_home.path(),
+        r#"[cloud_runtime]
+enabled = true
+runtime_profile = "read_only"
+
+"#,
+    )?;
+    let marker = codex_home.path().join("process-local-fallback-marker");
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let process_request_id = mcp
+        .send_process_spawn_request(process_spawn_params(
+            "cloud-runtime-process".to_string(),
+            codex_home.path(),
+            vec![
+                "sh".to_string(),
+                "-lc".to_string(),
+                "printf 'ran' > \"$1\"".to_string(),
+                "sh".to_string(),
+                marker.display().to_string(),
+            ],
+        )?)
+        .await?;
+    let error = mcp
+        .read_stream_until_error_message(RequestId::Integer(process_request_id))
+        .await?;
+    assert_eq!(
+        error.error.message,
+        "process/spawn is disabled for cloud runtime read-only profile"
+    );
+    assert!(!marker.exists());
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn process_spawn_reports_buffered_output_cap_reached() -> Result<()> {
     let codex_home = TempDir::new()?;
     let (_server, mut mcp) = initialized_mcp(codex_home.path()).await?;
@@ -176,6 +218,18 @@ async fn process_spawn_reports_buffered_output_cap_reached() -> Result<()> {
         }
     );
 
+    Ok(())
+}
+
+fn insert_process_exec_config(codex_home: &Path, inserted_config: &str) -> Result<()> {
+    let config_path = codex_home.join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    let marker = "\n[model_providers.mock_provider]\n";
+    let (prefix, suffix) = config
+        .split_once(marker)
+        .context("test config should include mock provider table")?;
+    let config = format!("{prefix}\n{inserted_config}{marker}{suffix}");
+    std::fs::write(config_path, config)?;
     Ok(())
 }
 

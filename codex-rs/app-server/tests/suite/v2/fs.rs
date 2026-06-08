@@ -1,6 +1,7 @@
 use anyhow::Context;
 use anyhow::Result;
 use app_test_support::TestAppServer;
+use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::to_response;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -138,6 +139,86 @@ async fn fs_methods_return_error_when_local_environment_is_disabled() -> Result<
         })
         .await?;
     expect_error_message(&mut mcp, read_id, "local filesystem is not configured").await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cloud_runtime_rejects_fs_write_methods_without_local_side_effects() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let file_path = codex_home.path().join("blocked-file.txt");
+    let dir_path = codex_home.path().join("blocked-dir");
+    let source_path = codex_home.path().join("source-file.txt");
+    let copy_path = codex_home.path().join("blocked-copy.txt");
+    std::fs::write(&source_path, "source")?;
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    insert_fs_config(
+        codex_home.path(),
+        r#"[cloud_runtime]
+enabled = true
+runtime_profile = "read_only"
+
+"#,
+    )?;
+    let mut mcp = initialized_mcp(&codex_home).await?;
+
+    let write_id = mcp
+        .send_fs_write_file_request(FsWriteFileParams {
+            path: absolute_path(file_path.clone()),
+            data_base64: STANDARD.encode("blocked"),
+        })
+        .await?;
+    expect_error_message(
+        &mut mcp,
+        write_id,
+        "fs/writeFile is disabled for cloud runtime read-only profile",
+    )
+    .await?;
+    assert!(!file_path.exists());
+
+    let create_id = mcp
+        .send_fs_create_directory_request(codex_app_server_protocol::FsCreateDirectoryParams {
+            path: absolute_path(dir_path.clone()),
+            recursive: None,
+        })
+        .await?;
+    expect_error_message(
+        &mut mcp,
+        create_id,
+        "fs/createDirectory is disabled for cloud runtime read-only profile",
+    )
+    .await?;
+    assert!(!dir_path.exists());
+
+    let copy_id = mcp
+        .send_fs_copy_request(FsCopyParams {
+            source_path: absolute_path(source_path),
+            destination_path: absolute_path(copy_path.clone()),
+            recursive: false,
+        })
+        .await?;
+    expect_error_message(
+        &mut mcp,
+        copy_id,
+        "fs/copy is disabled for cloud runtime read-only profile",
+    )
+    .await?;
+    assert!(!copy_path.exists());
+
+    let remove_id = mcp
+        .send_fs_remove_request(codex_app_server_protocol::FsRemoveParams {
+            path: absolute_path(codex_home.path().join("missing-remove-target")),
+            recursive: None,
+            force: None,
+        })
+        .await?;
+    expect_error_message(
+        &mut mcp,
+        remove_id,
+        "fs/remove is disabled for cloud runtime read-only profile",
+    )
+    .await?;
 
     Ok(())
 }
@@ -880,3 +961,16 @@ fn replace_file_atomically(path: &PathBuf, contents: &str) -> Result<()> {
     std::fs::rename(temp_path, path)?;
     Ok(())
 }
+
+fn insert_fs_config(codex_home: &std::path::Path, inserted_config: &str) -> Result<()> {
+    let config_path = codex_home.join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    let marker = "\n[model_providers.mock_provider]\n";
+    let (prefix, suffix) = config
+        .split_once(marker)
+        .context("test config should include mock provider table")?;
+    let config = format!("{prefix}\n{inserted_config}{marker}{suffix}");
+    std::fs::write(config_path, config)?;
+    Ok(())
+}
+use super::connection_handling_websocket::create_config_toml;

@@ -9,6 +9,7 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::flat_tool_name;
+use crate::tools::handlers::cloud_runtime_read_only_enabled;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
@@ -45,6 +46,15 @@ impl McpHandler {
     }
 }
 
+fn mcp_tool_declares_read_only(tool_info: &ToolInfo) -> bool {
+    tool_info
+        .tool
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.read_only_hint)
+        .unwrap_or(false)
+}
+
 fn join_tool_name(tool_name: &ToolName) -> String {
     match tool_name.namespace.as_deref() {
         Some(namespace) => {
@@ -77,14 +87,7 @@ impl ToolExecutor<ToolInvocation> for McpHandler {
     fn supports_parallel_tool_calls(&self) -> bool {
         // Correctly implemented MCP servers should tolerate parallel calls to
         // tools that advertise themselves as read-only.
-        self.tool_info.supports_parallel_tool_calls
-            || self
-                .tool_info
-                .tool
-                .annotations
-                .as_ref()
-                .and_then(|annotations| annotations.read_only_hint)
-                .unwrap_or(false)
+        self.tool_info.supports_parallel_tool_calls || mcp_tool_declares_read_only(&self.tool_info)
     }
 
     fn search_info(&self) -> Option<ToolSearchInfo> {
@@ -133,6 +136,14 @@ impl ToolExecutor<ToolInvocation> for McpHandler {
                 ));
             }
         };
+
+        if cloud_runtime_read_only_enabled(&turn.config)
+            && !mcp_tool_declares_read_only(&self.tool_info)
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "MCP tool is disabled for cloud runtime read-only profile unless it declares readOnlyHint=true".to_string(),
+            ));
+        }
 
         let started = Instant::now();
         let result = handle_mcp_tool_call(
@@ -312,6 +323,7 @@ mod search_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CloudRuntimeConfig;
     use crate::session::tests::make_session_and_context;
     use crate::tools::context::ToolCallSource;
     use crate::tools::hook_names::HookToolName;
@@ -322,6 +334,33 @@ mod tests {
     use serde_json::json;
     use std::time::Duration;
     use tokio::sync::Mutex;
+
+    fn enable_cloud_runtime_read_only(turn: &mut crate::TurnContext) {
+        let mut config = (*turn.config).clone();
+        config.cloud_runtime = CloudRuntimeConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        turn.config = Arc::new(config);
+    }
+
+    fn mcp_invocation(
+        session: Arc<crate::session::session::Session>,
+        turn: Arc<crate::TurnContext>,
+        tool_name: codex_tools::ToolName,
+        payload: ToolPayload,
+    ) -> ToolInvocation {
+        ToolInvocation {
+            session,
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-mcp".to_string(),
+            tool_name,
+            source: ToolCallSource::Direct,
+            payload,
+        }
+    }
 
     #[tokio::test]
     async fn mcp_pre_tool_use_payload_uses_prefixed_tool_name_and_raw_args() {
@@ -473,6 +512,65 @@ mod tests {
                     "structuredContent": { "bytes": 5 }
                 }),
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_runtime_read_only_rejects_mcp_tool_without_read_only_hint() {
+        let payload = ToolPayload::Function {
+            arguments: json!({ "path": "/tmp/notes.txt" }).to_string(),
+        };
+        let (session, mut turn) = make_session_and_context().await;
+        enable_cloud_runtime_read_only(&mut turn);
+        let handler = McpHandler::new(tool_info("filesystem", "filesystem", "write_file"))
+            .expect("MCP tool spec should build");
+
+        let result = handler
+            .handle(mcp_invocation(
+                session.into(),
+                turn.into(),
+                codex_tools::ToolName::namespaced("filesystem", "write_file"),
+                payload,
+            ))
+            .await;
+
+        assert_eq!(
+            result.err(),
+            FunctionCallError::RespondToModel(
+                "MCP tool is disabled for cloud runtime read-only profile unless it declares readOnlyHint=true"
+                    .to_string()
+            )
+            .into()
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_runtime_read_only_rejects_mcp_tool_with_writable_hint() {
+        let payload = ToolPayload::Function {
+            arguments: json!({ "path": "/tmp/notes.txt" }).to_string(),
+        };
+        let (session, mut turn) = make_session_and_context().await;
+        enable_cloud_runtime_read_only(&mut turn);
+        let mut info = tool_info("filesystem", "filesystem", "write_file");
+        info.tool.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(false));
+        let handler = McpHandler::new(info).expect("MCP tool spec should build");
+
+        let result = handler
+            .handle(mcp_invocation(
+                session.into(),
+                turn.into(),
+                codex_tools::ToolName::namespaced("filesystem", "write_file"),
+                payload,
+            ))
+            .await;
+
+        assert_eq!(
+            result.err(),
+            FunctionCallError::RespondToModel(
+                "MCP tool is disabled for cloud runtime read-only profile unless it declares readOnlyHint=true"
+                    .to_string()
+            )
+            .into()
         );
     }
 

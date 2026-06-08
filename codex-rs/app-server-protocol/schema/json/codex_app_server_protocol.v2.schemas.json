@@ -675,6 +675,17 @@
     "AppToolsConfig": {
       "type": "object"
     },
+    "AppendThreadItem": {
+      "properties": {
+        "payloadRef": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "payloadRef"
+      ],
+      "type": "object"
+    },
     "ApprovalsReviewer": {
       "description": "Configures who approval requests are routed to for review. Examples include sandbox escapes, blocked network access, MCP approval prompts, and ARC escalations. Defaults to `user`. `auto_review` uses a carefully prompted subagent to gather relevant context and apply a risk-based decision framework before approving or denying the request. The legacy value `guardian_subagent` is accepted for compatibility.",
       "enum": [
@@ -10284,6 +10295,31 @@
       "title": "RemoteControlStatusChangedNotification",
       "type": "object"
     },
+    "RequestEvent": {
+      "properties": {
+        "eventType": {
+          "type": "string"
+        },
+        "payloadInline": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "eventType",
+        "payloadInline",
+        "requestId",
+        "sequence"
+      ],
+      "type": "object"
+    },
     "RequestId": {
       "anyOf": [
         {
@@ -10320,6 +10356,52 @@
         }
       },
       "type": "object"
+    },
+    "RequestRecord": {
+      "properties": {
+        "latestEventCursor": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/RequestStatus"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "latestEventCursor",
+        "requestId",
+        "status",
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "RequestStatus": {
+      "enum": [
+        "queued",
+        "running",
+        "cancelling",
+        "completed",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "owner_timed_out",
+        "lease_lost",
+        "turn_timed_out"
+      ],
+      "type": "string"
     },
     "ResidencyRequirement": {
       "enum": [
@@ -13255,6 +13337,19 @@
       "title": "TerminalInteractionNotification",
       "type": "object"
     },
+    "TerminalSignal": {
+      "enum": [
+        "cancel_confirmed",
+        "runtime_write_denied",
+        "writer_lease_lost",
+        "owner_lease_timed_out",
+        "turn_timed_out",
+        "interrupted",
+        "failed",
+        "completed"
+      ],
+      "type": "string"
+    },
     "TextElement": {
       "properties": {
         "byteRange": {
@@ -14622,6 +14717,27 @@
           "type": "object"
         }
       ]
+    },
+    "ThreadItemRecord": {
+      "properties": {
+        "payloadRef": {
+          "type": "string"
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "payloadRef",
+        "sequence",
+        "threadId"
+      ],
+      "type": "object"
     },
     "ThreadListCwdFilter": {
       "anyOf": [
@@ -17051,6 +17167,27 @@
         "okOverridden"
       ],
       "type": "string"
+    },
+    "WriterLeaseRecord": {
+      "properties": {
+        "fencingToken": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "leaseId": {
+          "type": "string"
+        },
+        "writerOwnerToken": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "fencingToken",
+        "leaseId",
+        "writerOwnerToken"
+      ],
+      "type": "object"
     }
   },
   "title": "CodexAppServerProtocolV2",

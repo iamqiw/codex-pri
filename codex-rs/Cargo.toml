@@ -22,6 +22,8 @@ members = [
     "codex-backend-openapi-models",
     "code-mode",
     "cloud-config",
+    "cloud-state",
+    "cloud-wrapper-protocol",
     "cloud-tasks",
     "cloud-tasks-client",
     "cloud-tasks-mock-client",
@@ -152,6 +154,8 @@ codex-cli = { path = "cli" }
 codex-client = { path = "codex-client" }
 codex-collaboration-mode-templates = { path = "collaboration-mode-templates" }
 codex-cloud-config = { path = "cloud-config" }
+codex-cloud-state = { path = "cloud-state" }
+codex-cloud-wrapper-protocol = { path = "cloud-wrapper-protocol" }
 codex-cloud-tasks-client = { path = "cloud-tasks-client" }
 codex-cloud-tasks-mock-client = { path = "cloud-tasks-mock-client" }
 codex-code-mode = { path = "code-mode" }
@@ -377,6 +381,7 @@ sqlx = { version = "0.9.0", default-features = false, features = [
     "json",
     "macros",
     "migrate",
+    "mysql",
     "runtime-tokio",
     "tls-rustls",
     "sqlite-bundled",

@@ -29,6 +29,7 @@ use crate::tools::handlers::ViewImageHandler;
 use crate::tools::handlers::WriteStdinHandler;
 use crate::tools::handlers::agent_jobs::ReportAgentJobResultHandler;
 use crate::tools::handlers::agent_jobs::SpawnAgentsOnCsvHandler;
+use crate::tools::handlers::cloud_runtime_read_only_enabled;
 use crate::tools::handlers::extension_tools::ExtensionToolAdapter;
 use crate::tools::handlers::multi_agents::CloseAgentHandler;
 use crate::tools::handlers::multi_agents::ResumeAgentHandler;
@@ -288,6 +289,10 @@ fn multi_agent_v2_enabled(turn_context: &TurnContext) -> bool {
 }
 
 fn collab_tools_enabled(turn_context: &TurnContext) -> bool {
+    if cloud_runtime_read_only_enabled(turn_context.config.as_ref()) {
+        return false;
+    }
+
     match turn_context.multi_agent_version {
         MultiAgentVersion::Disabled => false,
         MultiAgentVersion::V1 => !exceeds_thread_spawn_depth_limit(
@@ -639,7 +644,9 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
         ));
     }
 
-    if environment_mode.has_environment() && turn_context.model_info.apply_patch_tool_type.is_some()
+    if environment_mode.has_environment()
+        && turn_context.model_info.apply_patch_tool_type.is_some()
+        && !cloud_runtime_read_only_enabled(turn_context.config.as_ref())
     {
         let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
         planned_tools.add(ApplyPatchHandler::new(include_environment_id));

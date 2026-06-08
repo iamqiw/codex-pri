@@ -33,8 +33,8 @@ impl CommandExecRequestProcessor {
         request_id: &ConnectionRequestId,
         params: CommandExecParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.require_local_environment()?;
-        self.exec_one_off_command(request_id, params)
+        let environment = self.command_exec_environment()?;
+        self.exec_one_off_command(request_id, params, environment)
             .await
             .map(|()| None)
     }
@@ -86,12 +86,38 @@ impl CommandExecRequestProcessor {
             .ok_or_else(|| internal_error("local environment is not configured"))
     }
 
+    fn command_exec_environment(
+        &self,
+    ) -> Result<Option<Arc<codex_exec_server::Environment>>, JSONRPCErrorError> {
+        if self.config.cloud_runtime.enabled
+            && matches!(
+                self.config.cloud_runtime.runtime_profile,
+                CloudRuntimeProfile::ReadOnly
+            )
+        {
+            let Some(environment) = self.environment_manager.default_environment() else {
+                return Err(internal_error(
+                    "read-only exec-server is required for cloud runtime command/exec and is not configured",
+                ));
+            };
+            if !environment.is_remote() {
+                return Err(internal_error(
+                    "read-only exec-server is required for cloud runtime command/exec and is not configured",
+                ));
+            }
+            return Ok(Some(environment));
+        }
+        self.require_local_environment()?;
+        Ok(None)
+    }
+
     async fn exec_one_off_command(
         &self,
         request_id: &ConnectionRequestId,
         params: CommandExecParams,
+        environment: Option<Arc<codex_exec_server::Environment>>,
     ) -> Result<(), JSONRPCErrorError> {
-        self.exec_one_off_command_inner(request_id.clone(), params)
+        self.exec_one_off_command_inner(request_id.clone(), params, environment)
             .await
     }
 
@@ -99,6 +125,7 @@ impl CommandExecRequestProcessor {
         &self,
         request_id: ConnectionRequestId,
         params: CommandExecParams,
+        environment: Option<Arc<codex_exec_server::Environment>>,
     ) -> Result<(), JSONRPCErrorError> {
         tracing::debug!("ExecOneOffCommand params: {params:?}");
 
@@ -334,6 +361,7 @@ impl CommandExecRequestProcessor {
                 process_id,
                 exec_request,
                 started_network_proxy: started_network_proxy_for_task,
+                environment,
                 tty,
                 stream_stdin,
                 stream_stdout_stderr,

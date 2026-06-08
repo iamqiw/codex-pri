@@ -501,6 +501,7 @@ impl ExecutorStdioServerLauncher {
                 tty: false,
                 pipe_stdin: true,
                 arg0: None,
+                scratch_scope: None,
             })
             .await
             .map_err(io::Error::other)?;

@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 
+use crate::config::CloudRuntimeConfig;
 use crate::session::tests::make_session_and_context;
 use crate::tools::context::ToolInvocation;
 use crate::tools::hook_names::HookToolName;
@@ -39,6 +40,87 @@ async fn invocation_for_payload(payload: ToolPayload) -> ToolInvocation {
         source: crate::tools::context::ToolCallSource::Direct,
         payload,
     }
+}
+
+async fn cloud_runtime_invocation_for_payload(payload: ToolPayload) -> ToolInvocation {
+    let (session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config.cloud_runtime = CloudRuntimeConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    turn.config = Arc::new(config);
+    ToolInvocation {
+        session: session.into(),
+        turn: turn.into(),
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: "call-apply-patch".to_string(),
+        tool_name: codex_tools::ToolName::plain("apply_patch"),
+        source: crate::tools::context::ToolCallSource::Direct,
+        payload,
+    }
+}
+
+#[tokio::test]
+async fn cloud_runtime_read_only_rejects_apply_patch_tool() {
+    let invocation = cloud_runtime_invocation_for_payload(ToolPayload::Custom {
+        input: sample_patch().to_string(),
+    })
+    .await;
+
+    let Err(err) = ApplyPatchHandler::default().handle(invocation).await else {
+        panic!("apply_patch should be disabled");
+    };
+
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(
+            "apply_patch is disabled for cloud runtime read-only profile".to_string(),
+        )
+    );
+}
+
+#[tokio::test]
+async fn cloud_runtime_read_only_rejects_intercepted_apply_patch_command() {
+    let (session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config.cloud_runtime = CloudRuntimeConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    turn.config = Arc::new(config);
+    let turn = Arc::new(turn);
+    let turn_environment = turn
+        .environments
+        .primary()
+        .expect("test turn should have an environment")
+        .clone();
+    let cwd = turn_environment.cwd.clone();
+    let command = vec!["apply_patch".to_string(), sample_patch().to_string()];
+
+    let Err(err) = intercept_apply_patch(
+        &command,
+        &cwd,
+        LOCAL_FS.as_ref(),
+        turn_environment,
+        session.into(),
+        turn,
+        /*tracker*/ None,
+        "call-apply-patch",
+        "exec_command",
+    )
+    .await
+    else {
+        panic!("intercepted apply_patch should be disabled");
+    };
+
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(
+            "apply_patch is disabled for cloud runtime read-only profile".to_string(),
+        )
+    );
 }
 
 #[tokio::test]

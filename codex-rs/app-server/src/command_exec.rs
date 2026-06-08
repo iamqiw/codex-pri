@@ -23,6 +23,11 @@ use codex_core::exec::ExecExpiration;
 use codex_core::exec::ExecExpirationOutcome;
 use codex_core::exec::IO_DRAIN_TIMEOUT_MS;
 use codex_core::sandboxing::ExecRequest;
+use codex_exec_server::ExecOutputStream;
+use codex_exec_server::ExecParams as ExecServerParams;
+use codex_exec_server::ExecProcess;
+use codex_exec_server::StartedExecProcess;
+use codex_exec_server::WriteStatus;
 use codex_protocol::exec_output::bytes_to_string_smart;
 use codex_sandboxing::SandboxType;
 use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
@@ -90,6 +95,7 @@ pub(crate) struct StartCommandExecParams {
     pub(crate) process_id: Option<String>,
     pub(crate) exec_request: ExecRequest,
     pub(crate) started_network_proxy: Option<StartedNetworkProxy>,
+    pub(crate) environment: Option<Arc<codex_exec_server::Environment>>,
     pub(crate) tty: bool,
     pub(crate) stream_stdin: bool,
     pub(crate) stream_stdout_stderr: bool,
@@ -106,6 +112,32 @@ struct RunCommandParams {
     stream_stdin: bool,
     stream_stdout_stderr: bool,
     expiration: ExecExpiration,
+    output_bytes_cap: Option<usize>,
+}
+
+struct RunRemoteCommandParams {
+    outgoing: Arc<OutgoingMessageSender>,
+    request_id: ConnectionRequestId,
+    process_id: Option<String>,
+    process: Arc<dyn ExecProcess>,
+    control_rx: mpsc::Receiver<CommandControlRequest>,
+    stream_stdin: bool,
+    stream_stdout_stderr: bool,
+    expiration: ExecExpiration,
+    output_bytes_cap: Option<usize>,
+}
+
+struct StartRemoteCommandParams {
+    outgoing: Arc<OutgoingMessageSender>,
+    request_id: ConnectionRequestId,
+    process_key: ConnectionProcessId,
+    notification_process_id: Option<String>,
+    exec_request: ExecRequest,
+    environment: Arc<codex_exec_server::Environment>,
+    started_network_proxy: Option<StartedNetworkProxy>,
+    tty: bool,
+    stream_stdin: bool,
+    stream_stdout_stderr: bool,
     output_bytes_cap: Option<usize>,
 }
 
@@ -128,6 +160,7 @@ enum InternalProcessId {
 
 trait InternalProcessIdExt {
     fn error_repr(&self) -> String;
+    fn exec_server_process_id(&self) -> String;
 }
 
 impl InternalProcessIdExt for InternalProcessId {
@@ -135,6 +168,13 @@ impl InternalProcessIdExt for InternalProcessId {
         match self {
             Self::Generated(id) => id.to_string(),
             Self::Client(id) => serde_json::to_string(id).unwrap_or_else(|_| format!("{id:?}")),
+        }
+    }
+
+    fn exec_server_process_id(&self) -> String {
+        match self {
+            Self::Generated(id) => id.to_string(),
+            Self::Client(id) => id.clone(),
         }
     }
 }
@@ -150,6 +190,7 @@ impl CommandExecManager {
             process_id,
             exec_request,
             started_network_proxy,
+            environment,
             tty,
             stream_stdin,
             stream_stdout_stderr,
@@ -173,6 +214,10 @@ impl CommandExecManager {
         let process_key = ConnectionProcessId {
             connection_id: request_id.connection_id,
             process_id: process_id.clone(),
+        };
+        let notification_process_id = match &process_id {
+            InternalProcessId::Generated(_) => None,
+            InternalProcessId::Client(process_id) => Some(process_id.clone()),
         };
 
         if matches!(exec_request.sandbox, SandboxType::WindowsRestrictedToken) {
@@ -228,6 +273,24 @@ impl CommandExecManager {
             return Ok(());
         }
 
+        if let Some(environment) = environment {
+            return self
+                .start_remote(StartRemoteCommandParams {
+                    outgoing,
+                    request_id,
+                    process_key,
+                    notification_process_id,
+                    exec_request,
+                    environment,
+                    started_network_proxy,
+                    tty,
+                    stream_stdin,
+                    stream_stdout_stderr,
+                    output_bytes_cap,
+                })
+                .await;
+        }
+
         let ExecRequest {
             command,
             cwd,
@@ -241,11 +304,6 @@ impl CommandExecManager {
         let stream_stdin = tty || stream_stdin;
         let stream_stdout_stderr = tty || stream_stdout_stderr;
         let (control_tx, control_rx) = mpsc::channel(32);
-        let notification_process_id = match &process_id {
-            InternalProcessId::Generated(_) => None,
-            InternalProcessId::Client(process_id) => Some(process_id.clone()),
-        };
-
         let sessions = Arc::clone(&self.sessions);
         let (program, args) = command
             .split_first()
@@ -293,6 +351,98 @@ impl CommandExecManager {
                 request_id: request_id.clone(),
                 process_id: notification_process_id,
                 spawned,
+                control_rx,
+                stream_stdin,
+                stream_stdout_stderr,
+                expiration,
+                output_bytes_cap,
+            })
+            .await;
+            sessions.lock().await.remove(&process_key);
+        });
+        Ok(())
+    }
+
+    async fn start_remote(
+        &self,
+        params: StartRemoteCommandParams,
+    ) -> Result<(), JSONRPCErrorError> {
+        let StartRemoteCommandParams {
+            outgoing,
+            request_id,
+            process_key,
+            notification_process_id,
+            exec_request,
+            environment,
+            started_network_proxy,
+            tty,
+            stream_stdin,
+            stream_stdout_stderr,
+            output_bytes_cap,
+        } = params;
+        let ExecRequest {
+            command,
+            cwd,
+            env,
+            expiration,
+            sandbox: _sandbox,
+            arg0,
+            ..
+        } = exec_request;
+
+        if command.is_empty() {
+            return Err(invalid_request("command must not be empty"));
+        }
+
+        let stream_stdin = tty || stream_stdin;
+        let stream_stdout_stderr = tty || stream_stdout_stderr;
+        let (control_tx, control_rx) = mpsc::channel(32);
+        {
+            let mut sessions = self.sessions.lock().await;
+            if sessions.contains_key(&process_key) {
+                return Err(invalid_request(format!(
+                    "duplicate active command/exec process id: {}",
+                    process_key.process_id.error_repr(),
+                )));
+            }
+            sessions.insert(
+                process_key.clone(),
+                CommandExecSession::Active { control_tx },
+            );
+        }
+
+        let started = environment
+            .get_exec_backend()
+            .start(ExecServerParams {
+                process_id: process_key.process_id.exec_server_process_id().into(),
+                argv: command,
+                cwd: cwd.to_path_buf(),
+                env_policy: None,
+                env,
+                tty,
+                pipe_stdin: stream_stdin,
+                arg0,
+                scratch_scope: None,
+            })
+            .await;
+        let StartedExecProcess { process } = match started {
+            Ok(started) => started,
+            Err(err) => {
+                self.sessions.lock().await.remove(&process_key);
+                return Err(internal_error(format!(
+                    "failed to spawn remote command: {err}"
+                )));
+            }
+        };
+
+        let sessions = Arc::clone(&self.sessions);
+        tokio::spawn(async move {
+            let _started_network_proxy = started_network_proxy;
+            run_remote_command(RunRemoteCommandParams {
+                outgoing,
+                request_id: request_id.clone(),
+                process_id: notification_process_id,
+                process,
                 control_rx,
                 stream_stdin,
                 stream_stdout_stderr,
@@ -553,6 +703,145 @@ async fn run_command(params: RunCommandParams) {
         .await;
 }
 
+async fn run_remote_command(params: RunRemoteCommandParams) {
+    let RunRemoteCommandParams {
+        outgoing,
+        request_id,
+        process_id,
+        process,
+        control_rx,
+        stream_stdin,
+        stream_stdout_stderr,
+        expiration,
+        output_bytes_cap,
+    } = params;
+    let mut control_rx = control_rx;
+    let mut control_open = true;
+    let expiration = expiration.wait_with_outcome();
+    tokio::pin!(expiration);
+    let mut expiration_outcome = None;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut observed_num_bytes = 0usize;
+    let mut after_seq = None;
+    let mut exit_code = None;
+
+    loop {
+        tokio::select! {
+            control = control_rx.recv(), if control_open => {
+                match control {
+                    Some(CommandControlRequest { control, response_tx }) => {
+                        let result = match control {
+                            CommandControl::Write { delta, close_stdin } => {
+                                handle_remote_process_write(
+                                    process.as_ref(),
+                                    stream_stdin,
+                                    delta,
+                                    close_stdin,
+                                ).await
+                            }
+                            CommandControl::Resize { .. } => Err(invalid_request(
+                                "command/exec/resize is not supported for remote exec-server processes",
+                            )),
+                            CommandControl::Terminate => process
+                                .terminate()
+                                .await
+                                .map_err(|err| internal_error(format!("failed to terminate remote command: {err}"))),
+                        };
+                        if let Some(response_tx) = response_tx {
+                            let _ = response_tx.send(result);
+                        }
+                    },
+                    None => {
+                        control_open = false;
+                        let _ = process.terminate().await;
+                    }
+                }
+            }
+            outcome = &mut expiration, if expiration_outcome.is_none() => {
+                expiration_outcome = Some(outcome);
+                let _ = process.terminate().await;
+            }
+            read_result = process.read(after_seq, /*max_bytes*/ None, /*wait_ms*/ Some(100)) => {
+                let response = match read_result {
+                    Ok(response) => response,
+                    Err(err) => {
+                        outgoing
+                            .send_error(
+                                request_id,
+                                internal_error(format!("remote command read failed: {err}")),
+                            )
+                            .await;
+                        return;
+                    }
+                };
+                for chunk in response.chunks {
+                    after_seq = Some(chunk.seq);
+                    let stream = match chunk.stream {
+                        ExecOutputStream::Stdout => CommandExecOutputStream::Stdout,
+                        ExecOutputStream::Stderr => CommandExecOutputStream::Stderr,
+                        ExecOutputStream::Pty => CommandExecOutputStream::Stdout,
+                    };
+                    let chunk = chunk.chunk.into_inner();
+                    let capped_chunk = match output_bytes_cap {
+                        Some(output_bytes_cap) => {
+                            let capped_chunk_len = output_bytes_cap
+                                .saturating_sub(observed_num_bytes)
+                                .min(chunk.len());
+                            observed_num_bytes += capped_chunk_len;
+                            &chunk[0..capped_chunk_len]
+                        }
+                        None => chunk.as_slice(),
+                    };
+                    let cap_reached = Some(observed_num_bytes) == output_bytes_cap;
+                    if let (true, Some(process_id)) = (stream_stdout_stderr, process_id.as_ref()) {
+                        outgoing
+                            .send_server_notification_to_connection_and_wait(
+                                request_id.connection_id,
+                                ServerNotification::CommandExecOutputDelta(
+                                    CommandExecOutputDeltaNotification {
+                                        process_id: process_id.clone(),
+                                        stream,
+                                        delta_base64: STANDARD.encode(capped_chunk),
+                                        cap_reached,
+                                    },
+                                ),
+                            )
+                            .await;
+                    } else if !stream_stdout_stderr {
+                        match stream {
+                            CommandExecOutputStream::Stdout => stdout.extend_from_slice(capped_chunk),
+                            CommandExecOutputStream::Stderr => stderr.extend_from_slice(capped_chunk),
+                        }
+                    }
+                }
+                if response.exited {
+                    exit_code = response.exit_code;
+                }
+                if response.closed {
+                    break;
+                }
+            }
+        }
+    }
+
+    let exit_code = if matches!(expiration_outcome, Some(ExecExpirationOutcome::TimedOut)) {
+        EXEC_TIMEOUT_EXIT_CODE
+    } else {
+        exit_code.unwrap_or(-1)
+    };
+    outgoing
+        .send_response(
+            request_id,
+            CommandExecResponse {
+                exit_code,
+                stdout: bytes_to_string_smart(&stdout),
+                stderr: bytes_to_string_smart(&stderr),
+            },
+        )
+        .await;
+}
+
 fn spawn_process_output(params: SpawnProcessOutputParams) -> tokio::task::JoinHandle<String> {
     let SpawnProcessOutputParams {
         connection_id,
@@ -639,6 +928,38 @@ async fn handle_process_write(
         session.close_stdin();
     }
     Ok(())
+}
+
+async fn handle_remote_process_write(
+    process: &dyn ExecProcess,
+    stream_stdin: bool,
+    delta: Vec<u8>,
+    close_stdin: bool,
+) -> Result<(), JSONRPCErrorError> {
+    if !stream_stdin {
+        return Err(invalid_request(
+            "stdin streaming is not enabled for this command/exec",
+        ));
+    }
+    if close_stdin {
+        return Err(invalid_request(
+            "closeStdin is not supported for remote command/exec",
+        ));
+    }
+    if delta.is_empty() {
+        return Ok(());
+    }
+    match process.write(delta).await {
+        Ok(response) => match response.status {
+            WriteStatus::Accepted => Ok(()),
+            WriteStatus::UnknownProcess => Err(invalid_request("remote process is unknown")),
+            WriteStatus::StdinClosed => Err(invalid_request("stdin is already closed")),
+            WriteStatus::Starting => Err(invalid_request("remote process is still starting")),
+        },
+        Err(err) => Err(internal_error(format!(
+            "failed to write to remote command: {err}"
+        ))),
+    }
 }
 
 fn handle_process_resize(
@@ -728,6 +1049,7 @@ mod tests {
                 process_id: Some("proc-42".to_string()),
                 exec_request: windows_sandbox_exec_request(),
                 started_network_proxy: None,
+                environment: None,
                 tty: false,
                 stream_stdin: false,
                 stream_stdout_stderr: true,
@@ -764,6 +1086,7 @@ mod tests {
                 process_id: Some("proc-99".to_string()),
                 exec_request: windows_sandbox_exec_request(),
                 started_network_proxy: None,
+                environment: None,
                 tty: false,
                 stream_stdin: false,
                 stream_stdout_stderr: false,
@@ -827,6 +1150,7 @@ mod tests {
                     /*arg0*/ None,
                 ),
                 started_network_proxy: None,
+                environment: None,
                 tty: false,
                 stream_stdin: false,
                 stream_stdout_stderr: false,
@@ -917,6 +1241,7 @@ mod tests {
                     /*arg0*/ None,
                 ),
                 started_network_proxy: None,
+                environment: None,
                 tty: false,
                 stream_stdin: false,
                 stream_stdout_stderr: false,

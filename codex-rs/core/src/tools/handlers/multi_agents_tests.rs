@@ -1,6 +1,7 @@
 use super::*;
 use crate::ThreadManager;
 use crate::config::AgentRoleConfig;
+use crate::config::CloudRuntimeConfig;
 use crate::config::DEFAULT_AGENT_MAX_DEPTH;
 use crate::function_tool::FunctionCallError;
 use crate::init_state_db;
@@ -91,6 +92,15 @@ fn function_payload(args: serde_json::Value) -> ToolPayload {
 
 fn parse_agent_id(id: &str) -> ThreadId {
     ThreadId::from_string(id).expect("agent id should be valid")
+}
+
+fn enable_cloud_runtime_read_only(turn: &mut TurnContext) {
+    let mut config = (*turn.config).clone();
+    config.cloud_runtime = CloudRuntimeConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    turn.config = Arc::new(config);
 }
 
 fn thread_manager() -> ThreadManager {
@@ -214,6 +224,48 @@ async fn spawn_agent_rejects_empty_message() {
     assert_eq!(
         err,
         FunctionCallError::RespondToModel("Empty message can't be sent to an agent".to_string())
+    );
+}
+
+#[tokio::test]
+async fn cloud_runtime_read_only_rejects_spawn_agent_v1() {
+    let (session, mut turn) = make_session_and_context().await;
+    enable_cloud_runtime_read_only(&mut turn);
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "spawn_agent",
+        function_payload(json!({"message": "work"})),
+    );
+    let Err(err) = SpawnAgentHandler::default().handle(invocation).await else {
+        panic!("spawn_agent should be disabled");
+    };
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(
+            "spawn_agent is disabled for cloud runtime read-only profile".to_string(),
+        )
+    );
+}
+
+#[tokio::test]
+async fn cloud_runtime_read_only_rejects_spawn_agent_v2() {
+    let (session, mut turn) = make_session_and_context().await;
+    enable_cloud_runtime_read_only(&mut turn);
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "spawn_agent",
+        function_payload(json!({"task_name": "task", "message": "work"})),
+    );
+    let Err(err) = SpawnAgentHandlerV2::default().handle(invocation).await else {
+        panic!("spawn_agent should be disabled");
+    };
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(
+            "spawn_agent is disabled for cloud runtime read-only profile".to_string(),
+        )
     );
 }
 

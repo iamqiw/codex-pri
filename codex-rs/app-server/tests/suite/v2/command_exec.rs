@@ -15,18 +15,32 @@ use codex_app_server_protocol::CommandExecTerminateParams;
 use codex_app_server_protocol::CommandExecWriteParams;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
+use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxPolicy;
 use codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR;
+use codex_exec_server::ExecOutputStream;
+use codex_exec_server::ExecParams;
+use codex_exec_server::ExecResponse;
+use codex_exec_server::InitializeResponse;
+use codex_exec_server::ProcessOutputChunk;
+use codex_exec_server::ReadResponse;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
+use futures::SinkExt;
+use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::Path;
 use tempfile::TempDir;
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio::time::sleep;
 use tokio::time::timeout;
+use tokio_tungstenite::accept_async;
+use tokio_tungstenite::tungstenite::Message;
 
 use super::connection_handling_websocket::DEFAULT_READ_TIMEOUT;
 use super::connection_handling_websocket::assert_no_message;
@@ -130,6 +144,136 @@ async fn command_exec_without_process_id_keeps_buffered_compatibility() -> Resul
             stderr: "legacy-err".to_string(),
         }
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cloud_runtime_command_exec_requires_read_only_exec_server_without_local_fallback()
+-> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    insert_command_exec_config(
+        codex_home.path(),
+        r#"[cloud_runtime]
+enabled = true
+runtime_profile = "read_only"
+
+"#,
+    )?;
+    let marker = codex_home.path().join("local-fallback-marker");
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let command_request_id = mcp
+        .send_command_exec_request(CommandExecParams {
+            command: vec![
+                "sh".to_string(),
+                "-lc".to_string(),
+                "printf 'ran' > \"$1\"".to_string(),
+                "sh".to_string(),
+                marker.display().to_string(),
+            ],
+            process_id: None,
+            tty: false,
+            stream_stdin: false,
+            stream_stdout_stderr: false,
+            output_bytes_cap: None,
+            disable_output_cap: false,
+            disable_timeout: false,
+            timeout_ms: None,
+            cwd: None,
+            env: None,
+            size: None,
+            sandbox_policy: None,
+            permission_profile: None,
+        })
+        .await?;
+
+    let error = mcp
+        .read_stream_until_error_message(RequestId::Integer(command_request_id))
+        .await?;
+    assert_eq!(
+        error.error.message,
+        "read-only exec-server is required for cloud runtime command/exec and is not configured"
+    );
+    assert!(!marker.exists());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cloud_runtime_command_exec_routes_to_read_only_exec_server() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    insert_command_exec_config(
+        codex_home.path(),
+        r#"[cloud_runtime]
+enabled = true
+runtime_profile = "read_only"
+
+"#,
+    )?;
+    let marker = codex_home.path().join("local-fallback-marker");
+    let fake_exec_server = FakeExecServer::start("remote-out").await?;
+    let mut mcp = TestAppServer::new_with_env(
+        codex_home.path(),
+        &[(
+            CODEX_EXEC_SERVER_URL_ENV_VAR,
+            Some(fake_exec_server.websocket_url.as_str()),
+        )],
+    )
+    .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let command_request_id = mcp
+        .send_command_exec_request(CommandExecParams {
+            command: vec![
+                "sh".to_string(),
+                "-lc".to_string(),
+                "printf 'local' > \"$1\"; printf 'local-out'".to_string(),
+                "sh".to_string(),
+                marker.display().to_string(),
+            ],
+            process_id: None,
+            tty: false,
+            stream_stdin: false,
+            stream_stdout_stderr: false,
+            output_bytes_cap: None,
+            disable_output_cap: false,
+            disable_timeout: false,
+            timeout_ms: None,
+            cwd: None,
+            env: None,
+            size: None,
+            sandbox_policy: None,
+            permission_profile: None,
+        })
+        .await?;
+
+    let response = mcp
+        .read_stream_until_response_message(RequestId::Integer(command_request_id))
+        .await?;
+    let response: CommandExecResponse = to_response(response)?;
+    assert_eq!(
+        response,
+        CommandExecResponse {
+            exit_code: 0,
+            stdout: "remote-out".to_string(),
+            stderr: String::new(),
+        }
+    );
+    assert!(!marker.exists());
+    let exec_params = fake_exec_server.exec_params().await?;
+    assert!(exec_params.argv.ends_with(&[
+        "sh".to_string(),
+        "-lc".to_string(),
+        "printf 'local' > \"$1\"; printf 'local-out'".to_string(),
+        "sh".to_string(),
+        marker.display().to_string(),
+    ]));
 
     Ok(())
 }
@@ -1224,6 +1368,123 @@ fn insert_command_exec_config(codex_home: &Path, inserted_config: &str) -> Resul
     let config = format!("{prefix}\n{inserted_config}{marker}{suffix}");
     std::fs::write(config_path, config)?;
     Ok(())
+}
+
+struct FakeExecServer {
+    websocket_url: String,
+    exec_params_rx: oneshot::Receiver<ExecParams>,
+}
+
+impl FakeExecServer {
+    async fn start(stdout: &'static str) -> Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let websocket_url = websocket_url(addr);
+        let (exec_params_tx, exec_params_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ = run_fake_exec_server(listener, stdout, exec_params_tx).await;
+        });
+        Ok(Self {
+            websocket_url,
+            exec_params_rx,
+        })
+    }
+
+    async fn exec_params(self) -> Result<ExecParams> {
+        self.exec_params_rx
+            .await
+            .context("fake exec-server should receive process/start")
+    }
+}
+
+fn websocket_url(addr: SocketAddr) -> String {
+    format!("ws://{addr}")
+}
+
+async fn run_fake_exec_server(
+    listener: TcpListener,
+    stdout: &'static str,
+    exec_params_tx: oneshot::Sender<ExecParams>,
+) -> Result<()> {
+    let (stream, _) = listener.accept().await?;
+    let mut websocket = accept_async(stream).await?;
+    let mut exec_params_tx = Some(exec_params_tx);
+
+    while let Some(message) = websocket.next().await {
+        let Message::Text(text) = message? else {
+            continue;
+        };
+        let request: JSONRPCMessage = serde_json::from_str(&text)?;
+        match request {
+            JSONRPCMessage::Request(request) if request.method == "initialize" => {
+                websocket
+                    .send(jsonrpc_response(
+                        request.id,
+                        InitializeResponse {
+                            session_id: "fake-session".to_string(),
+                        },
+                    )?)
+                    .await?;
+            }
+            JSONRPCMessage::Notification(JSONRPCNotification { method, .. })
+                if method == "initialized" => {}
+            JSONRPCMessage::Request(request) if request.method == "process/start" => {
+                let params: ExecParams =
+                    serde_json::from_value(request.params.context("process/start params")?)?;
+                if let Some(exec_params_tx) = exec_params_tx.take() {
+                    let _ = exec_params_tx.send(params.clone());
+                }
+                websocket
+                    .send(jsonrpc_response(
+                        request.id,
+                        ExecResponse {
+                            process_id: params.process_id,
+                        },
+                    )?)
+                    .await?;
+            }
+            JSONRPCMessage::Request(request) if request.method == "process/read" => {
+                websocket
+                    .send(jsonrpc_response(
+                        request.id,
+                        ReadResponse {
+                            chunks: vec![ProcessOutputChunk {
+                                seq: 1,
+                                stream: ExecOutputStream::Stdout,
+                                chunk: stdout.as_bytes().to_vec().into(),
+                            }],
+                            next_seq: 3,
+                            exited: true,
+                            exit_code: Some(0),
+                            closed: true,
+                            failure: None,
+                        },
+                    )?)
+                    .await?;
+            }
+            JSONRPCMessage::Request(request) if request.method == "process/terminate" => {
+                websocket
+                    .send(jsonrpc_response(
+                        request.id,
+                        serde_json::json!({ "running": false }),
+                    )?)
+                    .await?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn jsonrpc_response<T: serde::Serialize>(id: RequestId, result: T) -> Result<Message> {
+    Ok(Message::Text(
+        serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+            id,
+            result: serde_json::to_value(result)?,
+        }))?
+        .into(),
+    ))
 }
 
 async fn read_initialize_response(

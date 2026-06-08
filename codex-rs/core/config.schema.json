@@ -355,6 +355,42 @@
       },
       "type": "object"
     },
+    "CloudRuntimeProfileToml": {
+      "enum": [
+        "read_only"
+      ],
+      "type": "string"
+    },
+    "CloudRuntimeStateStoreToml": {
+      "enum": [
+        "in_memory",
+        "mysql"
+      ],
+      "type": "string"
+    },
+    "CloudRuntimeToml": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "mysql_max_connections": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "mysql_url_env_var": {
+          "type": "string"
+        },
+        "runtime_profile": {
+          "$ref": "#/definitions/CloudRuntimeProfileToml"
+        },
+        "state_store": {
+          "$ref": "#/definitions/CloudRuntimeStateStoreToml"
+        }
+      },
+      "type": "object"
+    },
     "ConfigProfile": {
       "additionalProperties": false,
       "description": "Collection of common configuration options that a user can define as a unit in `config.toml`.",
@@ -4430,6 +4466,14 @@
       ],
       "default": null,
       "description": "Preferred backend for storing CLI auth credentials. file (default): Use a file in the Codex home directory. keyring: Use an OS-specific keyring service. auto: Use the keyring if available, otherwise use a file."
+    },
+    "cloud_runtime": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/CloudRuntimeToml"
+        }
+      ],
+      "description": "Experimental / do not use. Enables cloud runtime constraints."
     },
     "compact_prompt": {
       "description": "Compact prompt used for history compaction.",

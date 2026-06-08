@@ -167,24 +167,24 @@ Example with notification opt-out:
 - `thread/realtime/appendText` — append text input to the active realtime session (experimental); returns `{}`.
 - `thread/realtime/stop` — stop the active realtime session for the thread (experimental); returns `{}`.
 - `review/start` — kick off Codex’s automated reviewer for a thread; responds like `turn/start` and emits `item/started`/`item/completed` notifications with `enteredReviewMode` and `exitedReviewMode` items, plus a final assistant `agentMessage` containing the review.
-- `command/exec` — run a single command under the server sandbox without starting a thread/turn (handy for utilities and validation).
+- `command/exec` — run a single command under the server sandbox without starting a thread/turn (handy for utilities and validation). When `[cloud_runtime] enabled = true` and `runtime_profile = "read_only"`, this RPC requires the default environment to be a remote exec-server and does not fall back to local app-server execution.
 - `command/exec/write` — write base64-decoded stdin bytes to a running `command/exec` session or close stdin; returns `{}`.
 - `command/exec/resize` — resize a running PTY-backed `command/exec` session by `processId`; returns `{}`.
 - `command/exec/terminate` — terminate a running `command/exec` session by `processId`; returns `{}`.
 - `command/exec/outputDelta` — notification emitted for base64-encoded stdout/stderr chunks from a streaming `command/exec` session.
-- `process/spawn` — experimental; spawn a standalone process without the Codex sandbox on the host where the app server is running; returns after the process starts and emits `process/outputDelta` and `process/exited` notifications.
+- `process/spawn` — experimental; spawn a standalone process without the Codex sandbox on the host where the app server is running; returns after the process starts and emits `process/outputDelta` and `process/exited` notifications. Disabled when `[cloud_runtime] enabled = true` and `runtime_profile = "read_only"`.
 - `process/writeStdin` — experimental; write base64-decoded stdin bytes to a running `process/spawn` session or close stdin; returns `{}`.
 - `process/resizePty` — experimental; resize a running PTY-backed `process/spawn` session by `processHandle`; returns `{}`.
 - `process/kill` — experimental; terminate a running `process/spawn` session by `processHandle`; returns `{}`.
 - `process/outputDelta` — experimental; notification emitted for base64-encoded stdout/stderr chunks from a streaming `process/spawn` session.
 - `process/exited` — experimental; notification emitted when a `process/spawn` session exits.
 - `fs/readFile` — read an absolute file path and return `{ dataBase64 }`.
-- `fs/writeFile` — write an absolute file path from base64-encoded `{ dataBase64 }`; returns `{}`.
-- `fs/createDirectory` — create an absolute directory path; `recursive` defaults to `true`.
+- `fs/writeFile` — write an absolute file path from base64-encoded `{ dataBase64 }`; returns `{}`. Disabled for cloud runtime read-only profiles.
+- `fs/createDirectory` — create an absolute directory path; `recursive` defaults to `true`. Disabled for cloud runtime read-only profiles.
 - `fs/getMetadata` — return metadata for an absolute path: `isDirectory`, `isFile`, `isSymlink`, `createdAtMs`, and `modifiedAtMs`.
 - `fs/readDirectory` — list direct child entries for an absolute directory path; each entry contains `fileName`, `isDirectory`, and `isFile`, and `fileName` is just the child name, not a path.
-- `fs/remove` — remove an absolute file or directory tree; `recursive` and `force` default to `true`.
-- `fs/copy` — copy between absolute paths; directory copies require `recursive: true`.
+- `fs/remove` — remove an absolute file or directory tree; `recursive` and `force` default to `true`. Disabled for cloud runtime read-only profiles.
+- `fs/copy` — copy between absolute paths; directory copies require `recursive: true`. Disabled for cloud runtime read-only profiles.
 - `fs/watch` — subscribe this connection to filesystem change notifications for an absolute file or directory path and caller-provided `watchId`; returns the canonicalized `path`.
 - `fs/unwatch` — stop sending notifications for a prior `fs/watch`; returns `{}`.
 - `fs/changed` — notification emitted when watched paths change, including the `watchId` and `changedPaths`.
@@ -194,6 +194,13 @@ Example with notification opt-out:
 - `permissionProfile/list` — beta; list available permission profile ids with optional display `description` text, using cursor pagination. Pass `cwd` when the caller needs project-local `[permissions.<id>]` entries to be included in the current catalog view.
 - `experimentalFeature/enablement/set` — patch the in-memory process-wide runtime feature enablement for currently supported feature keys. For each feature, precedence is: cloud requirements > --enable <feature_name> > config.toml > experimentalFeature/enablement/set (new) > code default.
 - `environment/add` — experimental; add or replace a named remote environment by `environmentId` and `execServerUrl` for later selection by `thread/start` or `turn/start`; returns `{}` and does not change the default environment.
+- `request/run` — experimental; create or reuse a cloud-wrapper request by `idempotencyKey`, optionally creating a thread when `threadId` is omitted. The response returns the request record, selected `threadId`, latest event cursor, and `writerLease` when the request is running. The current app-server implementation uses process-local in-memory state by default. Configure `[cloud_runtime] state_store = "mysql"` to use the MySQL-backed store; the database URL is read from `CODEX_CLOUD_STATE_MYSQL_URL` unless `mysql_url_env_var` names a different environment variable. `mysql_max_connections` configures the MySQL pool size and defaults to `20`.
+- `request/read` — experimental; read a cloud-wrapper request by `requestId`, including the latest event cursor.
+- `request/cancel` — experimental; mark a cloud-wrapper request cancelled and append a `request/cancelled` event. Optional `reason` is serialized as structured JSON in the event payload.
+- `request/terminal` — experimental; apply a terminal signal such as `completed`, `failed`, `owner_lease_timed_out`, `writer_lease_lost`, `runtime_write_denied`, `turn_timed_out`, or `interrupted`. The server persists the mapped terminal status and appends the corresponding request event unless the current status is already `completed`.
+- `request/events/list` — experimental; list cloud-wrapper request events after an optional cursor with optional limit, returning `data` and `nextCursor`. The server applies a bounded default and maximum page size.
+- `thread/appendWithLease` — experimental; append canonical thread item payload references with the writer lease returned by `request/run`, enforcing request/thread matching, lease id, and fencing token. Reusing `appendIdempotencyKey` returns the original append sequence range with `deduplicated: true` only for the original request and only when the submitted `payloadRef` list is identical; reusing the key from another request or with different payloads returns an idempotency conflict.
+- `thread/items/list` — experimental; list canonical thread item payload references after `thread/appendWithLease`, ordered by append sequence. The request supports cursor/limit pagination, and the server applies a bounded default and maximum page size.
 - `collaborationMode/list` — list available collaboration mode presets (experimental, no pagination). Built-in presets do not select a model; the Plan preset selects medium reasoning effort. This response omits built-in developer instructions; clients should either pass `settings.developer_instructions: null` when setting a mode to use Codex's built-in instructions, or provide their own instructions explicitly.
 - `skills/list` — list skills for one or more `cwd` values (optional `forceReload`).
 - `skills/extraRoots/set` — replace the app-server process runtime extra standalone skill roots. The roots are not persisted; missing directories are accepted and simply load no skills.

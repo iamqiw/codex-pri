@@ -23,6 +23,7 @@ use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch_spec::create_apply_patch_freeform_tool;
+use crate::tools::handlers::cloud_runtime_read_only_enabled;
 use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::handlers::updated_hook_command;
 use crate::tools::hook_names::HookToolName;
@@ -334,6 +335,11 @@ impl ToolExecutor<ToolInvocation> for ApplyPatchHandler {
                 "apply_patch handler received unsupported payload".to_string(),
             ));
         };
+        if cloud_runtime_read_only_enabled(&turn.config) {
+            return Err(FunctionCallError::RespondToModel(
+                "apply_patch is disabled for cloud runtime read-only profile".to_string(),
+            ));
+        }
         let args = match codex_apply_patch::parse_patch(&patch_input) {
             Ok(args) => args,
             Err(parse_error) => {
@@ -519,6 +525,11 @@ pub(crate) async fn intercept_apply_patch(
         .await
     {
         codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
+            if cloud_runtime_read_only_enabled(&turn.config) {
+                return Err(FunctionCallError::RespondToModel(
+                    "apply_patch is disabled for cloud runtime read-only profile".to_string(),
+                ));
+            }
             let (approval_keys, effective_additional_permissions, file_system_sandbox_policy) =
                 effective_patch_permissions(
                     session.as_ref(),

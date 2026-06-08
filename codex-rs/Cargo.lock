@@ -1914,6 +1914,8 @@ dependencies = [
  "codex-backend-client",
  "codex-chatgpt",
  "codex-cloud-config",
+ "codex-cloud-state",
+ "codex-cloud-wrapper-protocol",
  "codex-config",
  "codex-core",
  "codex-core-plugins",
@@ -2038,6 +2040,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "codex-cloud-wrapper-protocol",
  "codex-experimental-api-macros",
  "codex-protocol",
  "codex-shell-command",
@@ -2367,6 +2370,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-cloud-state"
+version = "0.0.0"
+dependencies = [
+ "codex-cloud-wrapper-protocol",
+ "pretty_assertions",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "codex-cloud-tasks"
 version = "0.0.0"
 dependencies = [
@@ -2421,6 +2437,17 @@ dependencies = [
  "chrono",
  "codex-cloud-tasks-client",
  "diffy",
+]
+
+[[package]]
+name = "codex-cloud-wrapper-protocol"
+version = "0.0.0"
+dependencies = [
+ "pretty_assertions",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "ts-rs",
 ]
 
 [[package]]

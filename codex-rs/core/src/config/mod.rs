@@ -573,6 +573,42 @@ pub enum ThreadStoreConfig {
     InMemory { id: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CloudRuntimeProfile {
+    #[default]
+    ReadOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CloudRuntimeStateStore {
+    #[default]
+    InMemory,
+    Mysql,
+}
+
+pub const CLOUD_RUNTIME_MYSQL_DEFAULT_MAX_CONNECTIONS: u32 = 20;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudRuntimeConfig {
+    pub enabled: bool,
+    pub runtime_profile: CloudRuntimeProfile,
+    pub state_store: CloudRuntimeStateStore,
+    pub mysql_url_env_var: Option<String>,
+    pub mysql_max_connections: u32,
+}
+
+impl Default for CloudRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            runtime_profile: CloudRuntimeProfile::ReadOnly,
+            state_store: CloudRuntimeStateStore::InMemory,
+            mysql_url_env_var: None,
+            mysql_max_connections: CLOUD_RUNTIME_MYSQL_DEFAULT_MAX_CONNECTIONS,
+        }
+    }
+}
+
 /// Application configuration loaded from disk and merged with overrides.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -960,6 +996,9 @@ pub struct Config {
 
     /// Experimental / do not use. Selects the thread persistence backend.
     pub experimental_thread_store: ThreadStoreConfig,
+
+    /// Experimental / do not use. Cloud runtime execution constraints.
+    pub cloud_runtime: CloudRuntimeConfig,
     /// When set, restricts ChatGPT login to one or more workspace identifiers.
     pub forced_chatgpt_workspace_id: Option<Vec<String>>,
 
@@ -2065,6 +2104,34 @@ fn thread_store_config(thread_store: Option<ThreadStoreToml>) -> ThreadStoreConf
         Some(ThreadStoreToml::Local {}) => ThreadStoreConfig::Local,
         Some(ThreadStoreToml::InMemory { id }) => ThreadStoreConfig::InMemory { id },
         None => ThreadStoreConfig::Local,
+    }
+}
+
+fn cloud_runtime_config(
+    cloud_runtime: Option<codex_config::config_toml::CloudRuntimeToml>,
+) -> CloudRuntimeConfig {
+    let Some(cloud_runtime) = cloud_runtime else {
+        return CloudRuntimeConfig::default();
+    };
+    CloudRuntimeConfig {
+        enabled: cloud_runtime.enabled.unwrap_or(false),
+        runtime_profile: match cloud_runtime.runtime_profile.unwrap_or_default() {
+            codex_config::config_toml::CloudRuntimeProfileToml::ReadOnly => {
+                CloudRuntimeProfile::ReadOnly
+            }
+        },
+        state_store: match cloud_runtime.state_store.unwrap_or_default() {
+            codex_config::config_toml::CloudRuntimeStateStoreToml::InMemory => {
+                CloudRuntimeStateStore::InMemory
+            }
+            codex_config::config_toml::CloudRuntimeStateStoreToml::Mysql => {
+                CloudRuntimeStateStore::Mysql
+            }
+        },
+        mysql_url_env_var: cloud_runtime.mysql_url_env_var,
+        mysql_max_connections: cloud_runtime
+            .mysql_max_connections
+            .unwrap_or(CLOUD_RUNTIME_MYSQL_DEFAULT_MAX_CONNECTIONS),
     }
 }
 
@@ -3544,6 +3611,7 @@ impl Config {
             experimental_realtime_start_instructions: cfg.experimental_realtime_start_instructions,
             experimental_thread_config_endpoint: cfg.experimental_thread_config_endpoint,
             experimental_thread_store: thread_store_config(cfg.experimental_thread_store),
+            cloud_runtime: cloud_runtime_config(cfg.cloud_runtime),
             forced_chatgpt_workspace_id,
             forced_login_method,
             web_search_mode: constrained_web_search_mode.value,

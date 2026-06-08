@@ -403,6 +403,9 @@ pub struct ConfigToml {
 
     /// Experimental / do not use. Selects the thread store implementation.
     pub experimental_thread_store: Option<ThreadStoreToml>,
+
+    /// Experimental / do not use. Enables cloud runtime constraints.
+    pub cloud_runtime: Option<CloudRuntimeToml>,
     pub projects: Option<HashMap<String, ProjectConfig>>,
 
     /// Controls the web search tool mode: disabled, cached, or live.
@@ -558,6 +561,31 @@ impl ProjectConfig {
     pub fn is_untrusted(&self) -> bool {
         matches!(self.trust_level, Some(TrustLevel::Untrusted))
     }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudRuntimeProfileToml {
+    #[default]
+    ReadOnly,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudRuntimeStateStoreToml {
+    #[default]
+    InMemory,
+    Mysql,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct CloudRuntimeToml {
+    pub enabled: Option<bool>,
+    pub runtime_profile: Option<CloudRuntimeProfileToml>,
+    pub state_store: Option<CloudRuntimeStateStoreToml>,
+    pub mysql_url_env_var: Option<String>,
+    pub mysql_max_connections: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -163,7 +163,12 @@ Request params:
   },
   "tty": true,
   "pipeStdin": false,
-  "arg0": null
+  "arg0": null,
+  "scratchScope": {
+    "callerId": "caller-1",
+    "threadId": "thread-1",
+    "requestId": "request-1"
+  }
 }
 ```
 
@@ -176,6 +181,12 @@ Field definitions:
 - `tty`: when `true`, spawn a PTY-backed interactive process.
 - `pipeStdin`: when `true`, keep non-PTY stdin writable via `process/write`.
 - `arg0`: optional argv0 override forwarded to `codex-utils-pty`.
+- `scratchScope`: optional read-only runtime scratch scope. When the exec-server
+  is configured with a scratch manager, the child receives
+  `CODEX_READ_ONLY_SCRATCH_DIR` pointing at a process-scoped temporary
+  directory. The directory name is derived from caller/thread/request/process
+  identifiers after sanitization and is removed when the process is evicted
+  after close.
 
 Response:
 

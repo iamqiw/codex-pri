@@ -37,6 +37,7 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_thread_store::ReadThreadParams;
 use serde_json::Value;
 
+use crate::config::CloudRuntimeProfile;
 use crate::context::ContextualUserFragment;
 use crate::context::HookAdditionalContext;
 use crate::event_mapping::parse_turn_item;
@@ -51,6 +52,7 @@ pub(crate) struct HookRuntimeOutcome {
     pub additional_contexts: Vec<String>,
 }
 
+#[derive(Debug, PartialEq)]
 pub(crate) enum PreToolUseHookResult {
     Continue { updated_input: Option<Value> },
     Blocked(String),
@@ -101,6 +103,11 @@ pub(crate) async fn run_pending_session_start_hooks(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
 ) -> bool {
+    if hooks_disabled_for_cloud_runtime_read_only(turn_context) {
+        while sess.take_pending_session_start_source().await.is_some() {}
+        return false;
+    }
+
     while let Some(session_start_source) = sess.take_pending_session_start_source().await {
         // Pending session-start hooks are reused to dispatch thread-spawn subagent
         // starts. Other subagent sessions are internal/system work and do not run
@@ -164,6 +171,12 @@ pub(crate) async fn run_pre_tool_use_hooks(
     tool_name: &HookToolName,
     tool_input: &Value,
 ) -> PreToolUseHookResult {
+    if hooks_disabled_for_cloud_runtime_read_only(turn_context) {
+        return PreToolUseHookResult::Continue {
+            updated_input: None,
+        };
+    }
+
     let request = PreToolUseRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
@@ -225,6 +238,10 @@ pub(crate) async fn run_permission_request_hooks(
     run_id_suffix: &str,
     payload: PermissionRequestPayload,
 ) -> Option<PermissionRequestDecision> {
+    if hooks_disabled_for_cloud_runtime_read_only(turn_context) {
+        return None;
+    }
+
     let request = PermissionRequestRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
@@ -267,6 +284,16 @@ pub(crate) async fn run_post_tool_use_hooks(
     tool_input: Value,
     tool_response: Value,
 ) -> PostToolUseOutcome {
+    if hooks_disabled_for_cloud_runtime_read_only(turn_context) {
+        return PostToolUseOutcome {
+            hook_events: Vec::new(),
+            should_stop: false,
+            stop_reason: None,
+            additional_contexts: Vec::new(),
+            feedback_message: None,
+        };
+    }
+
     let request = PostToolUseRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
@@ -297,6 +324,10 @@ pub(crate) async fn run_turn_stop_hooks(
     stop_hook_active: bool,
     last_assistant_message: Option<String>,
 ) -> StopOutcome {
+    if hooks_disabled_for_cloud_runtime_read_only(turn_context) {
+        return StopOutcome::default();
+    }
+
     // Resolve the stop hook kind from the session source before building the
     // request. Root turns run Stop; thread-spawned child turns run SubagentStop.
     let (target, transcript_path) = match &turn_context.session_source {
@@ -366,6 +397,10 @@ pub(crate) async fn run_pre_compact_hooks(
     turn_context: &Arc<TurnContext>,
     trigger: CompactionTrigger,
 ) -> PreCompactHookOutcome {
+    if hooks_disabled_for_cloud_runtime_read_only(turn_context) {
+        return PreCompactHookOutcome::Continue;
+    }
+
     let request = codex_hooks::PreCompactRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
@@ -405,6 +440,10 @@ pub(crate) async fn run_post_compact_hooks(
     turn_context: &Arc<TurnContext>,
     trigger: CompactionTrigger,
 ) -> PostCompactHookOutcome {
+    if hooks_disabled_for_cloud_runtime_read_only(turn_context) {
+        return PostCompactHookOutcome::Continue;
+    }
+
     let request = codex_hooks::PostCompactRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
@@ -433,6 +472,10 @@ pub(crate) async fn run_legacy_after_agent_hook(
     input: &[ResponseItem],
     last_assistant_message: Option<String>,
 ) -> bool {
+    if hooks_disabled_for_cloud_runtime_read_only(turn_context) {
+        return false;
+    }
+
     let mut abort_message = None;
     let input_messages = input
         .iter()
@@ -499,6 +542,13 @@ pub(crate) async fn inspect_pending_input(
     turn_context: &Arc<TurnContext>,
     pending_input_item: &TurnInput,
 ) -> HookRuntimeOutcome {
+    if hooks_disabled_for_cloud_runtime_read_only(turn_context) {
+        return HookRuntimeOutcome {
+            should_stop: false,
+            additional_contexts: Vec::new(),
+        };
+    }
+
     match pending_input_item {
         TurnInput::UserInput { content, .. } => {
             let request = UserPromptSubmitRequest {
@@ -601,6 +651,14 @@ fn additional_context_messages(additional_contexts: Vec<String>) -> Vec<Response
         .map(HookAdditionalContext::new)
         .map(ContextualUserFragment::into)
         .collect()
+}
+
+fn hooks_disabled_for_cloud_runtime_read_only(turn_context: &TurnContext) -> bool {
+    turn_context.config.cloud_runtime.enabled
+        && matches!(
+            turn_context.config.cloud_runtime.runtime_profile,
+            CloudRuntimeProfile::ReadOnly
+        )
 }
 
 async fn emit_hook_started_events(
@@ -765,19 +823,34 @@ fn compaction_trigger_label(value: CompactionTrigger) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use codex_hooks::Hooks;
+    use codex_hooks::HooksConfig;
     use codex_protocol::models::ContentItem;
+    use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::HookEventName;
     use codex_protocol::protocol::HookExecutionMode;
     use codex_protocol::protocol::HookHandlerType;
     use codex_protocol::protocol::HookRunStatus;
     use codex_protocol::protocol::HookScope;
     use codex_protocol::protocol::HookSource;
+    use core_test_support::hooks::trusted_config_layer_stack;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
 
+    use super::PreToolUseHookResult;
     use super::additional_context_messages;
     use super::hook_run_analytics_payload;
     use super::hook_run_metric_tags;
+    use super::run_pending_session_start_hooks;
+    use super::run_pre_tool_use_hooks;
+    use crate::config::CloudRuntimeConfig;
+    use crate::session::session::Session;
     use crate::session::tests::make_session_and_context;
+    use crate::session::turn_context::TurnContext;
+    use crate::tools::hook_names::HookToolName;
     use codex_protocol::protocol::HookCompletedEvent;
     use codex_protocol::protocol::HookRunSummary;
     use codex_utils_absolute_path::test_support::PathBufExt;
@@ -892,6 +965,66 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cloud_runtime_read_only_skips_pre_tool_use_hooks() {
+        let (mut session, mut turn_context) = make_session_and_context().await;
+        let log_path = install_pre_tool_use_blocking_hook(&mut session, &turn_context);
+        let mut config = (*turn_context.config).clone();
+        config.cloud_runtime = CloudRuntimeConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        turn_context.config = Arc::new(config);
+
+        let result = run_pre_tool_use_hooks(
+            &Arc::new(session),
+            &Arc::new(turn_context),
+            "call-hook".to_string(),
+            &HookToolName::bash(),
+            &json!({ "command": "echo should-not-run" }),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            PreToolUseHookResult::Continue {
+                updated_input: None
+            }
+        );
+        assert!(
+            !log_path.exists(),
+            "read-only cloud runtime must not execute hook command"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_runtime_read_only_drops_pending_session_start_sources() {
+        let (session, mut turn_context) = make_session_and_context().await;
+        session
+            .replace_compacted_history(
+                Vec::new(),
+                None,
+                CompactedItem {
+                    message: "summary".to_string(),
+                    replacement_history: None,
+                },
+            )
+            .await;
+        let mut config = (*turn_context.config).clone();
+        config.cloud_runtime = CloudRuntimeConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        turn_context.config = Arc::new(config);
+        let session = Arc::new(session);
+        let turn_context = Arc::new(turn_context);
+
+        let stopped = run_pending_session_start_hooks(&session, &turn_context).await;
+
+        assert_eq!(stopped, false);
+        assert!(session.take_pending_session_start_source().await.is_none());
+    }
+
     fn sample_hook_run(status: HookRunStatus, source: HookSource) -> HookRunSummary {
         HookRunSummary {
             id: "stop:0:/tmp/hooks.json".to_string(),
@@ -909,5 +1042,88 @@ mod tests {
             duration_ms: Some(27),
             entries: Vec::new(),
         }
+    }
+
+    fn install_pre_tool_use_blocking_hook(
+        session: &mut Session,
+        turn_context: &TurnContext,
+    ) -> PathBuf {
+        let script_path = turn_context.config.codex_home.join("pre_tool_use_hook.py");
+        let log_path = turn_context
+            .config
+            .codex_home
+            .join("pre_tool_use_hook_log.jsonl");
+        std::fs::create_dir_all(&turn_context.config.codex_home)
+            .expect("create codex home for hook fixture");
+        let script = format!(
+            r#"import json
+from pathlib import Path
+import sys
+
+payload = json.load(sys.stdin)
+with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(payload) + "\n")
+
+print({hook_output:?})
+"#,
+            log_path = log_path.display(),
+            hook_output = r#"{"decision":"block","reason":"blocked in test"}"#,
+        );
+        std::fs::write(&script_path, script).expect("write pre tool use hook script");
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let script_path_arg = if cfg!(windows) {
+            script_path.display().to_string()
+        } else {
+            format!(
+                "'{}'",
+                script_path.display().to_string().replace('\'', "'\\''")
+            )
+        };
+        std::fs::write(
+            turn_context.config.codex_home.join("hooks.json"),
+            serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{
+                            "type": "command",
+                            "command": format!("{python} {script_path_arg}"),
+                            "timeout_sec": 5,
+                        }]
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write hooks.json");
+
+        let hook_list = codex_hooks::list_hooks(HooksConfig {
+            feature_enabled: true,
+            config_layer_stack: Some(turn_context.config.config_layer_stack.clone()),
+            ..HooksConfig::default()
+        });
+        assert_eq!(hook_list.hooks.len(), 1);
+        let trusted_config_layer_stack = trusted_config_layer_stack(
+            &turn_context.config.config_layer_stack,
+            &turn_context.config.codex_home,
+            hook_list.hooks,
+        );
+
+        session
+            .services
+            .hooks
+            .store(Arc::new(Hooks::new(HooksConfig {
+                feature_enabled: true,
+                config_layer_stack: Some(trusted_config_layer_stack),
+                shell_program: (!cfg!(windows)).then_some("/bin/sh".to_string()),
+                shell_args: if cfg!(windows) {
+                    Vec::new()
+                } else {
+                    vec!["-c".to_string()]
+                },
+                ..HooksConfig::default()
+            })));
+
+        log_path.to_path_buf()
     }
 }

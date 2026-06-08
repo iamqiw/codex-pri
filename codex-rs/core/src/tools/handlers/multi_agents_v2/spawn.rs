@@ -5,6 +5,7 @@ use crate::agent::control::render_input_preview;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::apply_role_to_config;
+use crate::tools::handlers::cloud_runtime_read_only_enabled;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2;
 use crate::turn_timing::now_unix_timestamp_ms;
@@ -54,6 +55,11 @@ async fn handle_spawn_agent(
     } = invocation;
     let arguments = function_arguments(payload)?;
     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
+    if cloud_runtime_read_only_enabled(&turn.config) {
+        return Err(FunctionCallError::RespondToModel(
+            "spawn_agent is disabled for cloud runtime read-only profile".to_string(),
+        ));
+    }
     let fork_mode = args.fork_mode()?;
     let role_name = args
         .agent_type

@@ -24,6 +24,8 @@ use codex_app_server_protocol::FsWatchResponse;
 use codex_app_server_protocol::FsWriteFileParams;
 use codex_app_server_protocol::FsWriteFileResponse;
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_core::config::CloudRuntimeProfile;
+use codex_core::config::Config;
 use codex_exec_server::CopyOptions;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::EnvironmentManager;
@@ -36,16 +38,19 @@ use std::sync::Arc;
 pub(crate) struct FsRequestProcessor {
     environment_manager: Arc<EnvironmentManager>,
     fs_watch_manager: FsWatchManager,
+    config: Arc<Config>,
 }
 
 impl FsRequestProcessor {
     pub(crate) fn new(
         environment_manager: Arc<EnvironmentManager>,
         fs_watch_manager: FsWatchManager,
+        config: Arc<Config>,
     ) -> Self {
         Self {
             environment_manager,
             fs_watch_manager,
+            config,
         }
     }
 
@@ -78,6 +83,7 @@ impl FsRequestProcessor {
         &self,
         params: FsWriteFileParams,
     ) -> Result<FsWriteFileResponse, JSONRPCErrorError> {
+        self.require_write_enabled("fs/writeFile")?;
         let bytes = STANDARD.decode(params.data_base64).map_err(|err| {
             invalid_request(format!(
                 "fs/writeFile requires valid base64 dataBase64: {err}"
@@ -94,6 +100,7 @@ impl FsRequestProcessor {
         &self,
         params: FsCreateDirectoryParams,
     ) -> Result<FsCreateDirectoryResponse, JSONRPCErrorError> {
+        self.require_write_enabled("fs/createDirectory")?;
         self.file_system()?
             .create_directory(
                 &params.path,
@@ -150,6 +157,7 @@ impl FsRequestProcessor {
         &self,
         params: FsRemoveParams,
     ) -> Result<FsRemoveResponse, JSONRPCErrorError> {
+        self.require_write_enabled("fs/remove")?;
         self.file_system()?
             .remove(
                 &params.path,
@@ -168,6 +176,7 @@ impl FsRequestProcessor {
         &self,
         params: FsCopyParams,
     ) -> Result<FsCopyResponse, JSONRPCErrorError> {
+        self.require_write_enabled("fs/copy")?;
         self.file_system()?
             .copy(
                 &params.source_path,
@@ -198,6 +207,20 @@ impl FsRequestProcessor {
     ) -> Result<FsUnwatchResponse, JSONRPCErrorError> {
         self.file_system()?;
         self.fs_watch_manager.unwatch(connection_id, params).await
+    }
+
+    fn require_write_enabled(&self, method: &str) -> Result<(), JSONRPCErrorError> {
+        if self.config.cloud_runtime.enabled
+            && matches!(
+                self.config.cloud_runtime.runtime_profile,
+                CloudRuntimeProfile::ReadOnly
+            )
+        {
+            return Err(internal_error(format!(
+                "{method} is disabled for cloud runtime read-only profile"
+            )));
+        }
+        Ok(())
     }
 }
 

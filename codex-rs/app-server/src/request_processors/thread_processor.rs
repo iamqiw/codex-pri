@@ -335,6 +335,7 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) state_db: Option<StateDbHandle>,
     pub(super) background_tasks: TaskTracker,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
+    pub(super) cloud_wrapper_processor: Option<Arc<CloudWrapperRequestProcessor>>,
 }
 
 impl ThreadRequestProcessor {
@@ -354,6 +355,7 @@ impl ThreadRequestProcessor {
         thread_goal_processor: ThreadGoalRequestProcessor,
         state_db: Option<StateDbHandle>,
         skills_watcher: Arc<SkillsWatcher>,
+        cloud_wrapper_processor: Option<Arc<CloudWrapperRequestProcessor>>,
     ) -> Self {
         Self {
             auth_manager,
@@ -371,6 +373,7 @@ impl ThreadRequestProcessor {
             state_db,
             background_tasks: TaskTracker::new(),
             skills_watcher,
+            cloud_wrapper_processor,
         }
     }
 
@@ -391,6 +394,88 @@ impl ThreadRequestProcessor {
         )
         .await
         .map(|()| None)
+    }
+
+    pub(crate) async fn start_thread_for_cloud_request(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ThreadStartParams,
+        app_server_client_name: Option<String>,
+        app_server_client_version: Option<String>,
+        request_context: RequestContext,
+    ) -> Result<ThreadStartResponse, JSONRPCErrorError> {
+        let ThreadStartParams {
+            model,
+            model_provider,
+            service_tier,
+            cwd,
+            runtime_workspace_roots,
+            approval_policy,
+            approvals_reviewer,
+            sandbox,
+            permissions,
+            config,
+            service_name,
+            base_instructions,
+            developer_instructions,
+            dynamic_tools,
+            mock_experimental_field: _mock_experimental_field,
+            experimental_raw_events,
+            personality,
+            ephemeral,
+            session_start_source,
+            thread_source,
+            environments,
+        } = params;
+        if sandbox.is_some() && permissions.is_some() {
+            return Err(invalid_request(
+                "`permissions` cannot be combined with `sandbox`",
+            ));
+        }
+        let environment_selections = self.parse_environment_selections(environments)?;
+        let mut typesafe_overrides = self.build_thread_config_overrides(
+            model,
+            model_provider,
+            service_tier,
+            cwd,
+            runtime_workspace_roots,
+            approval_policy,
+            approvals_reviewer,
+            sandbox,
+            permissions,
+            base_instructions,
+            developer_instructions,
+            personality,
+        );
+        typesafe_overrides.ephemeral = ephemeral;
+        let listener_task_context = self.listener_task_context();
+        let (response, notif) = Self::thread_start_response(
+            listener_task_context.clone(),
+            self.config_manager.clone(),
+            &request_id,
+            app_server_client_name,
+            app_server_client_version,
+            config,
+            typesafe_overrides,
+            dynamic_tools,
+            session_start_source,
+            thread_source.map(Into::into),
+            environment_selections,
+            service_name,
+            experimental_raw_events,
+            request_context.request_trace(),
+        )
+        .instrument(request_context.span())
+        .await?;
+        listener_task_context
+            .outgoing
+            .send_server_notification(ServerNotification::ThreadStarted(notif))
+            .instrument(tracing::info_span!(
+                "app_server.thread_start.notify_started",
+                otel.name = "app_server.thread_start.notify_started",
+            ))
+            .await;
+        Ok(response)
     }
 
     pub(crate) async fn thread_unsubscribe(
@@ -782,6 +867,7 @@ impl ThreadRequestProcessor {
             fallback_model_provider: self.config.model_provider_id.clone(),
             codex_home: self.config.codex_home.to_path_buf(),
             skills_watcher: Arc::clone(&self.skills_watcher),
+            cloud_wrapper_processor: self.cloud_wrapper_processor.clone(),
         }
     }
 
@@ -867,17 +953,7 @@ impl ThreadRequestProcessor {
             personality,
         );
         typesafe_overrides.ephemeral = ephemeral;
-        let listener_task_context = ListenerTaskContext {
-            thread_manager: Arc::clone(&self.thread_manager),
-            thread_state_manager: self.thread_state_manager.clone(),
-            outgoing: Arc::clone(&self.outgoing),
-            pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
-            thread_watch_manager: self.thread_watch_manager.clone(),
-            thread_list_state_permit: self.thread_list_state_permit.clone(),
-            fallback_model_provider: self.config.model_provider_id.clone(),
-            codex_home: self.config.codex_home.to_path_buf(),
-            skills_watcher: Arc::clone(&self.skills_watcher),
-        };
+        let listener_task_context = self.listener_task_context();
         let request_trace = request_context.request_trace();
         let config_manager = self.config_manager.clone();
         let outgoing = Arc::clone(&listener_task_context.outgoing);
@@ -971,6 +1047,60 @@ impl ThreadRequestProcessor {
         experimental_raw_events: bool,
         request_trace: Option<W3cTraceContext>,
     ) -> Result<(), JSONRPCErrorError> {
+        let (response, notif) = Self::thread_start_response(
+            listener_task_context.clone(),
+            config_manager,
+            &request_id,
+            app_server_client_name,
+            app_server_client_version,
+            config_overrides,
+            typesafe_overrides,
+            dynamic_tools,
+            session_start_source,
+            thread_source,
+            environments,
+            service_name,
+            experimental_raw_events,
+            request_trace,
+        )
+        .await?;
+        listener_task_context
+            .outgoing
+            .send_response(request_id, response)
+            .instrument(tracing::info_span!(
+                "app_server.thread_start.send_response",
+                otel.name = "app_server.thread_start.send_response",
+            ))
+            .await;
+
+        listener_task_context
+            .outgoing
+            .send_server_notification(ServerNotification::ThreadStarted(notif))
+            .instrument(tracing::info_span!(
+                "app_server.thread_start.notify_started",
+                otel.name = "app_server.thread_start.notify_started",
+            ))
+            .await;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn thread_start_response(
+        listener_task_context: ListenerTaskContext,
+        config_manager: ConfigManager,
+        request_id: &ConnectionRequestId,
+        app_server_client_name: Option<String>,
+        app_server_client_version: Option<String>,
+        config_overrides: Option<HashMap<String, serde_json::Value>>,
+        typesafe_overrides: ConfigOverrides,
+        dynamic_tools: Option<Vec<ApiDynamicToolSpec>>,
+        session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
+        thread_source: Option<codex_protocol::protocol::ThreadSource>,
+        environments: Option<Vec<TurnEnvironmentSelection>>,
+        service_name: Option<String>,
+        experimental_raw_events: bool,
+        request_trace: Option<W3cTraceContext>,
+    ) -> Result<(ThreadStartResponse, ThreadStartedNotification), JSONRPCErrorError> {
         let thread_start_started_at = std::time::Instant::now();
         let requested_cwd = typesafe_overrides.cwd.clone();
         let mut config = config_manager
@@ -1188,30 +1318,13 @@ impl ThreadRequestProcessor {
             active_permission_profile,
             reasoning_effort: config_snapshot.reasoning_effort,
         };
-        let notif = thread_started_notification(thread);
-        listener_task_context
-            .outgoing
-            .send_response(request_id, response)
-            .instrument(tracing::info_span!(
-                "app_server.thread_start.send_response",
-                otel.name = "app_server.thread_start.send_response",
-            ))
-            .await;
-
-        listener_task_context
-            .outgoing
-            .send_server_notification(ServerNotification::ThreadStarted(notif))
-            .instrument(tracing::info_span!(
-                "app_server.thread_start.notify_started",
-                otel.name = "app_server.thread_start.notify_started",
-            ))
-            .await;
         session_telemetry.record_startup_phase(
             "thread_start_total",
             thread_start_started_at.elapsed(),
             Some("ready"),
         );
-        Ok(())
+        let notif = thread_started_notification(thread);
+        Ok((response, notif))
     }
 
     #[allow(clippy::too_many_arguments)]

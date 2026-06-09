@@ -13,6 +13,7 @@ pub(super) struct ListenerTaskContext {
     pub(super) fallback_model_provider: String,
     pub(super) codex_home: PathBuf,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
+    pub(super) cloud_wrapper_processor: Option<Arc<CloudWrapperRequestProcessor>>,
 }
 
 struct UnloadingState {
@@ -260,6 +261,7 @@ pub(super) async fn ensure_listener_task_running(
         thread_list_state_permit,
         fallback_model_provider,
         codex_home,
+        cloud_wrapper_processor,
         ..
     } = listener_task_context;
     let outgoing_for_task = Arc::clone(&outgoing);
@@ -322,6 +324,7 @@ pub(super) async fn ensure_listener_task_running(
                             &event.id,
                             &raw_response_item_event.item,
                             &thread_outgoing,
+                            None,
                         )
                         .await;
                         continue;
@@ -337,6 +340,7 @@ pub(super) async fn ensure_listener_task_running(
                         thread_watch_manager.clone(),
                         thread_list_state_permit.clone(),
                         fallback_model_provider.clone(),
+                        cloud_wrapper_processor.clone(),
                     )
                     .await;
                 }

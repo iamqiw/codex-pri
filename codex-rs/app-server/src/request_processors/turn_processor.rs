@@ -16,6 +16,7 @@ pub(crate) struct TurnRequestProcessor {
     thread_watch_manager: ThreadWatchManager,
     thread_list_state_permit: Arc<Semaphore>,
     skills_watcher: Arc<SkillsWatcher>,
+    cloud_wrapper_processor: Option<Arc<CloudWrapperRequestProcessor>>,
 }
 
 fn resolve_runtime_workspace_roots(
@@ -86,6 +87,7 @@ impl TurnRequestProcessor {
         thread_watch_manager: ThreadWatchManager,
         thread_list_state_permit: Arc<Semaphore>,
         skills_watcher: Arc<SkillsWatcher>,
+        cloud_wrapper_processor: Option<Arc<CloudWrapperRequestProcessor>>,
     ) -> Self {
         Self {
             auth_manager,
@@ -100,6 +102,7 @@ impl TurnRequestProcessor {
             thread_watch_manager,
             thread_list_state_permit,
             skills_watcher,
+            cloud_wrapper_processor,
         }
     }
 
@@ -118,6 +121,78 @@ impl TurnRequestProcessor {
         )
         .await
         .map(|response| Some(response.into()))
+    }
+
+    pub(crate) async fn start_turn_for_cloud_request(
+        &self,
+        request_id: ConnectionRequestId,
+        cloud_request_id: String,
+        caller_id: String,
+        params: TurnStartParams,
+        app_server_client_name: Option<String>,
+        app_server_client_version: Option<String>,
+    ) -> Result<TurnStartResponse, JSONRPCErrorError> {
+        self.ensure_cloud_thread_loaded(&request_id, &params.thread_id)
+            .await?;
+        let thread_id = params.thread_id.clone();
+        let response = self
+            .turn_start_inner(
+                request_id,
+                params,
+                app_server_client_name,
+                app_server_client_version,
+            )
+            .await?;
+        self.persist_cloud_request_context(
+            &caller_id,
+            &cloud_request_id,
+            &thread_id,
+            &response.turn.id,
+        )
+        .await?;
+        Ok(response)
+    }
+
+    async fn ensure_cloud_thread_loaded(
+        &self,
+        request_id: &ConnectionRequestId,
+        thread_id: &str,
+    ) -> Result<(), JSONRPCErrorError> {
+        let thread_id = ThreadId::from_string(thread_id)
+            .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
+        if self.thread_manager.get_thread(thread_id).await.is_ok() {
+            return Ok(());
+        }
+        if !self.config.cloud_runtime.enabled {
+            return Err(invalid_request(format!("thread not found: {thread_id}")));
+        }
+        let NewThread {
+            thread_id,
+            thread: _,
+            session_configured: _,
+            ..
+        } = self
+            .thread_manager
+            .resume_thread_from_store(
+                self.config.as_ref().clone(),
+                thread_id,
+                Arc::clone(&self.auth_manager),
+                self.request_trace_context(request_id).await,
+            )
+            .await
+            .map_err(|err| invalid_request(format!("thread not found: {err}")))?;
+        log_listener_attach_result(
+            self.ensure_conversation_listener(
+                thread_id,
+                request_id.connection_id,
+                /*raw_events_enabled*/ false,
+            )
+            .await,
+            thread_id,
+            request_id.connection_id,
+            "thread",
+        );
+        Ok(())
     }
 
     pub(crate) async fn thread_inject_items(
@@ -250,6 +325,56 @@ impl TurnRequestProcessor {
 
         Ok((thread_id, thread))
     }
+
+    async fn persist_cloud_request_context(
+        &self,
+        caller_id: &str,
+        cloud_request_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<(), JSONRPCErrorError> {
+        let Some(cloud_wrapper_processor) = self.cloud_wrapper_processor.as_ref() else {
+            return Ok(());
+        };
+        let (_, thread) = self.load_thread(thread_id).await?;
+        let snapshot = thread.config_snapshot().await;
+        let thread_settings = thread_settings_from_config_snapshot(&snapshot);
+        let config_json = serde_json::to_string(&serde_json::json!({
+            "turnId": turn_id,
+            "threadSettings": thread_settings,
+            "modelProvider": snapshot.model_provider_id,
+            "ephemeral": snapshot.ephemeral,
+        }))
+        .map_err(|err| {
+            internal_error(format!("failed to serialize cloud config snapshot: {err}"))
+        })?;
+        let state_metadata_json = serde_json::to_string(&serde_json::json!({
+            "turnId": turn_id,
+            "cwd": snapshot.cwd,
+            "model": snapshot.model,
+            "modelProvider": snapshot.model_provider_id,
+            "permissionProfile": snapshot.permission_profile,
+        }))
+        .map_err(|err| {
+            internal_error(format!("failed to serialize cloud state metadata: {err}"))
+        })?;
+        cloud_wrapper_processor
+            .persist_request_context(
+                caller_id,
+                codex_cloud_state::ConfigSnapshotRecord {
+                    request_id: cloud_request_id.to_string(),
+                    thread_id: thread_id.to_string(),
+                    config_json,
+                },
+                codex_cloud_state::StateMetadataRecord {
+                    thread_id: thread_id.to_string(),
+                    kind: "thread_effective_settings".to_string(),
+                    payload_json: state_metadata_json,
+                },
+            )
+            .await
+    }
+
     fn normalize_collaboration_mode(
         &self,
         mut collaboration_mode: CollaborationMode,
@@ -1278,6 +1403,7 @@ impl TurnRequestProcessor {
             fallback_model_provider: self.config.model_provider_id.clone(),
             codex_home: self.config.codex_home.to_path_buf(),
             skills_watcher: Arc::clone(&self.skills_watcher),
+            cloud_wrapper_processor: self.cloud_wrapper_processor.clone(),
         }
     }
 

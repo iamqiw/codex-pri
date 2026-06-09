@@ -23,6 +23,7 @@ pub struct RequestRecord {
     pub thread_id: String,
     pub idempotency_key: String,
     pub input_hash: String,
+    pub turn_id: Option<String>,
     pub status: RequestStatus,
     pub latest_event_cursor: u64,
 }
@@ -32,7 +33,7 @@ impl RequestRecord {
         ProtocolRequestRecord {
             request_id: self.request_id.clone(),
             thread_id: self.thread_id.clone(),
-            turn_id: None,
+            turn_id: self.turn_id.clone(),
             status: self.status,
             latest_event_cursor: self.latest_event_cursor,
         }
@@ -69,6 +70,20 @@ pub struct EventRecord {
 pub struct EventsPage {
     pub data: Vec<EventRecord>,
     pub next_cursor: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigSnapshotRecord {
+    pub request_id: String,
+    pub thread_id: String,
+    pub config_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateMetadataRecord {
+    pub thread_id: String,
+    pub kind: String,
+    pub payload_json: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +146,17 @@ pub trait CloudStateStore {
         request_id: &'a str,
     ) -> impl Future<Output = Result<RequestRecord, CloudStateError>> + Send + 'a;
 
+    fn read_request_by_turn_id<'a>(
+        &'a self,
+        turn_id: &'a str,
+    ) -> impl Future<Output = Result<RequestRecord, CloudStateError>> + Send + 'a;
+
+    fn set_request_turn_id<'a>(
+        &'a mut self,
+        request_id: &'a str,
+        turn_id: &'a str,
+    ) -> impl Future<Output = Result<RequestRecord, CloudStateError>> + Send + 'a;
+
     fn caller_can_access_thread<'a>(
         &'a self,
         caller_id: &'a str,
@@ -147,6 +173,16 @@ pub trait CloudStateStore {
         &'a self,
         request_id: &'a str,
     ) -> impl Future<Output = Result<Option<WriterLeaseRecord>, CloudStateError>> + Send + 'a;
+
+    fn renew_request_leases<'a>(
+        &'a mut self,
+        request_id: &'a str,
+        owner_instance_id: &'a str,
+    ) -> impl Future<Output = Result<bool, CloudStateError>> + Send + 'a;
+
+    fn expire_owner_leases(
+        &mut self,
+    ) -> impl Future<Output = Result<usize, CloudStateError>> + Send;
 
     fn append_thread_items_with_lease(
         &mut self,
@@ -189,6 +225,27 @@ pub trait CloudStateStore {
         cursor: Option<u64>,
         limit: usize,
     ) -> impl Future<Output = Result<EventsPage, CloudStateError>> + Send;
+
+    fn persist_config_snapshot(
+        &mut self,
+        record: ConfigSnapshotRecord,
+    ) -> impl Future<Output = Result<(), CloudStateError>> + Send;
+
+    fn read_config_snapshot<'a>(
+        &'a self,
+        request_id: &'a str,
+    ) -> impl Future<Output = Result<ConfigSnapshotRecord, CloudStateError>> + Send + 'a;
+
+    fn upsert_state_metadata(
+        &mut self,
+        record: StateMetadataRecord,
+    ) -> impl Future<Output = Result<(), CloudStateError>> + Send;
+
+    fn read_state_metadata<'a>(
+        &'a self,
+        thread_id: &'a str,
+        kind: &'a str,
+    ) -> impl Future<Output = Result<StateMetadataRecord, CloudStateError>> + Send + 'a;
 }
 
 #[derive(Debug, Default)]
@@ -199,6 +256,8 @@ pub struct InMemoryCloudStateStore {
     append_responses_by_key: HashMap<(String, String), AppendResultRecord>,
     events_by_request: HashMap<String, Vec<EventRecord>>,
     thread_items_by_thread: HashMap<String, Vec<ThreadItemRecord>>,
+    config_snapshots_by_request: HashMap<String, ConfigSnapshotRecord>,
+    state_metadata_by_thread_kind: HashMap<(String, String), StateMetadataRecord>,
     thread_versions: HashMap<String, u64>,
     next_request_sequence: u64,
     next_lease_sequence: u64,
@@ -247,6 +306,7 @@ impl InMemoryCloudStateStore {
             thread_id: params.thread_id,
             idempotency_key: params.idempotency_key,
             input_hash: params.input_hash,
+            turn_id: None,
             status: RequestStatus::Queued,
             latest_event_cursor: 0,
         };
@@ -263,6 +323,32 @@ impl InMemoryCloudStateStore {
             .get(request_id)
             .cloned()
             .ok_or(CloudStateError::RequestNotFound)
+    }
+
+    pub fn read_request_by_turn_id(&self, turn_id: &str) -> Result<RequestRecord, CloudStateError> {
+        self.requests_by_id
+            .values()
+            .find(|request| request.turn_id.as_deref() == Some(turn_id))
+            .cloned()
+            .ok_or(CloudStateError::RequestNotFound)
+    }
+
+    pub fn set_request_turn_id(
+        &mut self,
+        request_id: &str,
+        turn_id: &str,
+    ) -> Result<RequestRecord, CloudStateError> {
+        let mut record = self.read_request(request_id)?;
+        record.turn_id = Some(turn_id.to_string());
+        self.requests_by_id
+            .insert(request_id.to_string(), record.clone());
+        let key = (
+            record.caller_id.clone(),
+            record.thread_id.clone(),
+            record.idempotency_key.clone(),
+        );
+        self.requests_by_idempotency_key.insert(key, record.clone());
+        Ok(record)
     }
 
     pub fn caller_can_access_thread(
@@ -323,6 +409,39 @@ impl InMemoryCloudStateStore {
                 writer_owner_token: lease.owner_instance_id.clone(),
                 fencing_token: lease.fencing_token,
             }))
+    }
+
+    pub fn renew_request_leases(
+        &mut self,
+        request_id: &str,
+        owner_instance_id: &str,
+    ) -> Result<bool, CloudStateError> {
+        let request = self.read_request(request_id)?;
+        if request.status.is_terminal() {
+            return Ok(false);
+        }
+        let active = self
+            .held_leases_by_thread
+            .get(&request.thread_id)
+            .is_some_and(|lease| {
+                lease.request_id == request_id && lease.owner_instance_id == owner_instance_id
+            });
+        if active {
+            return Ok(true);
+        }
+        self.mark_request_terminal_with_event(
+            EventAppendParams {
+                request_id: request_id.to_string(),
+                event_type: "request/lease_lost".to_string(),
+                payload_inline: r#"{"reason":"thread_writer_lease_lost"}"#.to_string(),
+            },
+            RequestStatus::LeaseLost,
+        )?;
+        Ok(false)
+    }
+
+    pub fn expire_owner_leases(&mut self) -> Result<usize, CloudStateError> {
+        Ok(0)
     }
 
     pub fn append_thread_items_with_lease(
@@ -562,6 +681,52 @@ impl InMemoryCloudStateStore {
         Ok(EventsPage { data, next_cursor })
     }
 
+    pub fn persist_config_snapshot(
+        &mut self,
+        record: ConfigSnapshotRecord,
+    ) -> Result<(), CloudStateError> {
+        let request = self.read_request(&record.request_id)?;
+        if request.thread_id != record.thread_id {
+            return Err(CloudStateError::ThreadMismatch);
+        }
+        validate_json_payload(&record.config_json)?;
+        self.config_snapshots_by_request
+            .insert(record.request_id.clone(), record);
+        Ok(())
+    }
+
+    pub fn read_config_snapshot(
+        &self,
+        request_id: &str,
+    ) -> Result<ConfigSnapshotRecord, CloudStateError> {
+        self.read_request(request_id)?;
+        self.config_snapshots_by_request
+            .get(request_id)
+            .cloned()
+            .ok_or(CloudStateError::RequestNotFound)
+    }
+
+    pub fn upsert_state_metadata(
+        &mut self,
+        record: StateMetadataRecord,
+    ) -> Result<(), CloudStateError> {
+        validate_json_payload(&record.payload_json)?;
+        self.state_metadata_by_thread_kind
+            .insert((record.thread_id.clone(), record.kind.clone()), record);
+        Ok(())
+    }
+
+    pub fn read_state_metadata(
+        &self,
+        thread_id: &str,
+        kind: &str,
+    ) -> Result<StateMetadataRecord, CloudStateError> {
+        self.state_metadata_by_thread_kind
+            .get(&(thread_id.to_string(), kind.to_string()))
+            .cloned()
+            .ok_or(CloudStateError::RequestNotFound)
+    }
+
     fn set_request_status(
         &mut self,
         request_id: &str,
@@ -622,9 +787,13 @@ pub(crate) fn append_payload_refs_match(fingerprint: &str, payload_refs: &[Strin
 }
 
 pub(crate) fn validate_event_payload_inline(payload_inline: &str) -> Result<(), CloudStateError> {
+    validate_json_payload(payload_inline).map_err(|_| CloudStateError::InvalidEventPayload)
+}
+
+fn validate_json_payload(payload_inline: &str) -> Result<(), CloudStateError> {
     serde_json::from_str::<serde_json::Value>(payload_inline)
         .map(|_| ())
-        .map_err(|_| CloudStateError::InvalidEventPayload)
+        .map_err(|_| CloudStateError::Storage("payload must be valid JSON".to_string()))
 }
 
 impl CloudStateStore for InMemoryCloudStateStore {
@@ -637,6 +806,21 @@ impl CloudStateStore for InMemoryCloudStateStore {
 
     async fn read_request(&self, request_id: &str) -> Result<RequestRecord, CloudStateError> {
         InMemoryCloudStateStore::read_request(self, request_id)
+    }
+
+    async fn read_request_by_turn_id(
+        &self,
+        turn_id: &str,
+    ) -> Result<RequestRecord, CloudStateError> {
+        InMemoryCloudStateStore::read_request_by_turn_id(self, turn_id)
+    }
+
+    async fn set_request_turn_id(
+        &mut self,
+        request_id: &str,
+        turn_id: &str,
+    ) -> Result<RequestRecord, CloudStateError> {
+        InMemoryCloudStateStore::set_request_turn_id(self, request_id, turn_id)
     }
 
     async fn caller_can_access_thread(
@@ -660,6 +844,18 @@ impl CloudStateStore for InMemoryCloudStateStore {
         request_id: &str,
     ) -> Result<Option<WriterLeaseRecord>, CloudStateError> {
         InMemoryCloudStateStore::read_thread_writer_lease(self, request_id)
+    }
+
+    async fn renew_request_leases(
+        &mut self,
+        request_id: &str,
+        owner_instance_id: &str,
+    ) -> Result<bool, CloudStateError> {
+        InMemoryCloudStateStore::renew_request_leases(self, request_id, owner_instance_id)
+    }
+
+    async fn expire_owner_leases(&mut self) -> Result<usize, CloudStateError> {
+        InMemoryCloudStateStore::expire_owner_leases(self)
     }
 
     async fn append_thread_items_with_lease(
@@ -720,5 +916,34 @@ impl CloudStateStore for InMemoryCloudStateStore {
         limit: usize,
     ) -> Result<EventsPage, CloudStateError> {
         InMemoryCloudStateStore::list_request_events(self, request_id, cursor, limit)
+    }
+
+    async fn persist_config_snapshot(
+        &mut self,
+        record: ConfigSnapshotRecord,
+    ) -> Result<(), CloudStateError> {
+        InMemoryCloudStateStore::persist_config_snapshot(self, record)
+    }
+
+    async fn read_config_snapshot(
+        &self,
+        request_id: &str,
+    ) -> Result<ConfigSnapshotRecord, CloudStateError> {
+        InMemoryCloudStateStore::read_config_snapshot(self, request_id)
+    }
+
+    async fn upsert_state_metadata(
+        &mut self,
+        record: StateMetadataRecord,
+    ) -> Result<(), CloudStateError> {
+        InMemoryCloudStateStore::upsert_state_metadata(self, record)
+    }
+
+    async fn read_state_metadata(
+        &self,
+        thread_id: &str,
+        kind: &str,
+    ) -> Result<StateMetadataRecord, CloudStateError> {
+        InMemoryCloudStateStore::read_state_metadata(self, thread_id, kind)
     }
 }

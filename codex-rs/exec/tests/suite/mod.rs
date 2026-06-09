@@ -3,6 +3,7 @@ mod add_dir;
 mod apply_patch;
 mod approval_policy;
 mod auth_env;
+mod cloud_runtime;
 mod ephemeral;
 mod mcp_required_exit;
 mod originator;

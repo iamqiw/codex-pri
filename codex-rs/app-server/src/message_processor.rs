@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
@@ -64,10 +65,17 @@ use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::ServerRequestPayload;
+use codex_app_server_protocol::ThreadStartParams;
+use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::UserInput;
 use codex_app_server_protocol::experimental_required_message;
 use codex_arg0::Arg0DispatchPaths;
 use codex_chatgpt::workspace_settings;
+use codex_cloud_wrapper_protocol::RequestStatus;
+use codex_cloud_wrapper_protocol::RequestTerminalParams;
+use codex_cloud_wrapper_protocol::TerminalSignal;
 use codex_core::ThreadManager;
+use codex_core::config::CloudRuntimeStateStore;
 use codex_core::config::Config;
 use codex_exec_server::EnvironmentManager;
 use codex_feedback::CodexFeedback;
@@ -81,16 +89,21 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout::StateDbHandle;
 use codex_state::log_db::LogDbLayer;
+use codex_thread_store::ThreadStore;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tokio::time::Duration;
+
+const DEFAULT_CLOUD_STATE_MYSQL_URL_ENV_VAR: &str = "CODEX_CLOUD_STATE_MYSQL_URL";
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 const EXTERNAL_AUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
+const CLOUD_REQUEST_LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+const CLOUD_OWNER_LEASE_SCANNER_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct ExternalAuthRefreshBridge {
@@ -166,7 +179,7 @@ pub(crate) struct MessageProcessor {
     account_processor: AccountRequestProcessor,
     apps_processor: AppsRequestProcessor,
     catalog_processor: CatalogRequestProcessor,
-    cloud_wrapper_processor: CloudWrapperRequestProcessor,
+    cloud_wrapper_processor: Arc<CloudWrapperRequestProcessor>,
     command_exec_processor: CommandExecRequestProcessor,
     process_exec_processor: ProcessExecRequestProcessor,
     config_processor: ConfigRequestProcessor,
@@ -305,7 +318,37 @@ impl MessageProcessor {
         // The thread store is intentionally process-scoped. Config reloads can
         // affect per-thread behavior, but they must not move newly started,
         // resumed, or forked threads to a different persistence backend/root.
-        let thread_store = codex_core::thread_store_from_config(config.as_ref(), state_db.clone());
+        let thread_store: Arc<dyn ThreadStore> = match config.cloud_runtime.state_store {
+            CloudRuntimeStateStore::Mysql if config.cloud_runtime.enabled => {
+                let database_url_env_var = config
+                    .cloud_runtime
+                    .mysql_url_env_var
+                    .as_deref()
+                    .unwrap_or(DEFAULT_CLOUD_STATE_MYSQL_URL_ENV_VAR);
+                match std::env::var(database_url_env_var)
+                    .map_err(|err| err.to_string())
+                    .and_then(|database_url| {
+                        codex_cloud_state::MysqlCloudThreadStore::from_database_url_lazy_with_max_connections(
+                            &database_url,
+                            config.cloud_runtime.mysql_max_connections,
+                        )
+                        .map(Arc::new)
+                        .map(|store| store as Arc<dyn ThreadStore>)
+                        .map_err(|err| err.to_string())
+                    }) {
+                    Ok(store) => store,
+                    Err(err) => {
+                        tracing::warn!(
+                            "cloud runtime MySQL thread store is unavailable; falling back to configured thread store: {err}"
+                        );
+                        codex_core::thread_store_from_config(config.as_ref(), state_db.clone())
+                    }
+                }
+            }
+            CloudRuntimeStateStore::InMemory | CloudRuntimeStateStore::Mysql => {
+                codex_core::thread_store_from_config(config.as_ref(), state_db.clone())
+            }
+        };
         let environment_manager_for_requests = Arc::clone(&environment_manager);
         let thread_manager = Arc::new_cyclic(|thread_manager| {
             ThreadManager::new(
@@ -420,6 +463,10 @@ impl MessageProcessor {
             thread_state_manager.clone(),
             state_db.clone(),
         );
+        let cloud_wrapper_processor = Arc::new(CloudWrapperRequestProcessor::new(&config));
+        if config.cloud_runtime.enabled {
+            spawn_cloud_owner_lease_scanner(Arc::clone(&cloud_wrapper_processor));
+        }
         let thread_processor = ThreadRequestProcessor::new(
             auth_manager.clone(),
             Arc::clone(&thread_manager),
@@ -435,6 +482,7 @@ impl MessageProcessor {
             thread_goal_processor.clone(),
             state_db,
             Arc::clone(&skills_watcher),
+            Some(Arc::clone(&cloud_wrapper_processor)),
         );
         let turn_processor = TurnRequestProcessor::new(
             auth_manager.clone(),
@@ -449,6 +497,7 @@ impl MessageProcessor {
             thread_watch_manager,
             thread_list_state_permit,
             Arc::clone(&skills_watcher),
+            Some(Arc::clone(&cloud_wrapper_processor)),
         );
         if matches!(plugin_startup_tasks, crate::PluginStartupTasks::Start) {
             // Keep plugin startup warmups aligned at app-server startup.
@@ -496,7 +545,7 @@ impl MessageProcessor {
             account_processor,
             apps_processor,
             catalog_processor,
-            cloud_wrapper_processor: CloudWrapperRequestProcessor::new(&config),
+            cloud_wrapper_processor,
             command_exec_processor,
             process_exec_processor,
             config_processor,
@@ -945,12 +994,106 @@ impl MessageProcessor {
             ClientRequest::EnvironmentAdd { params, .. } => {
                 self.environment_processor.environment_add(params).await
             }
-            ClientRequest::RequestRun { params, .. } => {
+            ClientRequest::RequestRun { mut params, .. } => {
                 let caller_id = app_server_client_name.as_deref().unwrap_or("app-server");
-                self.cloud_wrapper_processor
+                let turn_input = params.input.clone();
+                let turn_cwd = params.cwd.clone().map(PathBuf::from);
+                if params.thread_id.is_none() {
+                    let thread_start = self
+                        .thread_processor
+                        .start_thread_for_cloud_request(
+                            request_id.clone(),
+                            ThreadStartParams {
+                                cwd: params.cwd.clone(),
+                                ..Default::default()
+                            },
+                            app_server_client_name.clone(),
+                            client_version.clone(),
+                            request_context.clone(),
+                        )
+                        .await?;
+                    params.thread_id = Some(thread_start.thread.id);
+                    params.create_thread = Some(false);
+                }
+                let mut response = self
+                    .cloud_wrapper_processor
                     .request_run(caller_id, params)
-                    .await
-                    .map(|response| Some(response.into()))
+                    .await?;
+                if response.request.status == RequestStatus::Running
+                    && response.request.turn_id.is_none()
+                {
+                    let turn_result = self
+                        .turn_processor
+                        .start_turn_for_cloud_request(
+                            request_id.clone(),
+                            response.request.request_id.clone(),
+                            caller_id.to_string(),
+                            TurnStartParams {
+                                thread_id: response.thread_id.clone(),
+                                client_user_message_id: None,
+                                input: vec![UserInput::Text {
+                                    text: turn_input,
+                                    text_elements: Vec::new(),
+                                }],
+                                responsesapi_client_metadata: None,
+                                additional_context: None,
+                                environments: None,
+                                cwd: turn_cwd,
+                                runtime_workspace_roots: None,
+                                approval_policy: None,
+                                approvals_reviewer: None,
+                                sandbox_policy: None,
+                                permissions: None,
+                                model: None,
+                                service_tier: None,
+                                effort: None,
+                                summary: None,
+                                personality: None,
+                                output_schema: None,
+                                collaboration_mode: None,
+                            },
+                            app_server_client_name.clone(),
+                            client_version.clone(),
+                        )
+                        .await;
+                    match turn_result {
+                        Ok(turn_response) => {
+                            let request_read = self
+                                .cloud_wrapper_processor
+                                .set_turn_id(
+                                    caller_id,
+                                    &response.request.request_id,
+                                    &turn_response.turn.id,
+                                )
+                                .await?;
+                            response.request = request_read.request;
+                            response.event_cursor = request_read.latest_event_cursor;
+                            spawn_cloud_request_lease_heartbeat(
+                                Arc::clone(&self.cloud_wrapper_processor),
+                                response.request.request_id.clone(),
+                                caller_id.to_string(),
+                            );
+                        }
+                        Err(error) => {
+                            let _ = self
+                                .cloud_wrapper_processor
+                                .request_terminal(
+                                    caller_id,
+                                    RequestTerminalParams {
+                                        request_id: response.request.request_id.clone(),
+                                        signal: TerminalSignal::Failed,
+                                        payload_inline: Some(
+                                            serde_json::json!({ "error": error.message.clone() })
+                                                .to_string(),
+                                        ),
+                                    },
+                                )
+                                .await;
+                            return Err(error);
+                        }
+                    }
+                }
+                Ok(Some(response.into()))
             }
             ClientRequest::RequestRead { params, .. } => {
                 let caller_id = app_server_client_name.as_deref().unwrap_or("app-server");
@@ -1435,6 +1578,45 @@ impl MessageProcessor {
         }
         Ok(())
     }
+}
+
+fn spawn_cloud_request_lease_heartbeat(
+    cloud_wrapper_processor: Arc<CloudWrapperRequestProcessor>,
+    request_id: String,
+    owner_instance_id: String,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(CLOUD_REQUEST_LEASE_HEARTBEAT_INTERVAL);
+        loop {
+            interval.tick().await;
+            match cloud_wrapper_processor
+                .renew_request_leases(&request_id, &owner_instance_id)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(err) => {
+                    tracing::debug!(
+                        request_id,
+                        "failed to renew cloud request leases: {}",
+                        err.message
+                    );
+                }
+            }
+        }
+    });
+}
+
+fn spawn_cloud_owner_lease_scanner(cloud_wrapper_processor: Arc<CloudWrapperRequestProcessor>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(CLOUD_OWNER_LEASE_SCANNER_INTERVAL);
+        loop {
+            interval.tick().await;
+            if let Err(err) = cloud_wrapper_processor.expire_owner_leases().await {
+                tracing::debug!("failed to scan expired cloud owner leases: {}", err.message);
+            }
+        }
+    });
 }
 
 #[cfg(test)]

@@ -8,8 +8,20 @@ use codex_cloud_wrapper_protocol::RequestStatus;
 use codex_cloud_wrapper_protocol::TerminalSignal;
 use codex_cloud_wrapper_protocol::ThreadItemRecord;
 use codex_cloud_wrapper_protocol::ThreadItemsListParams;
+use codex_protocol::ThreadId;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::models::BaseInstructions;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadMemoryMode;
+use codex_protocol::protocol::TurnStartedEvent;
+use codex_thread_store::AppendThreadItemsParams;
+use codex_thread_store::CreateThreadParams;
+use codex_thread_store::ThreadPersistenceMetadata;
+use codex_thread_store::ThreadStore;
 use pretty_assertions::assert_eq;
 use sqlx::MySqlPool;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::CloudRequestService;
@@ -21,6 +33,7 @@ use crate::LeaseAcquireOutcome;
 use crate::LeaseAppendParams;
 use crate::MysqlCloudStateSchema;
 use crate::MysqlCloudStateStore;
+use crate::MysqlCloudThreadStore;
 use crate::TerminalStatusUpdate;
 
 #[test]
@@ -31,6 +44,9 @@ fn mysql_schema_declares_request_lease_append_and_event_tables() {
     assert!(statements.contains("UNIQUE KEY cloud_requests_idempotency_key"));
     assert!(statements.contains("CREATE TABLE IF NOT EXISTS cloud_thread_writer_leases"));
     assert!(statements.contains("UNIQUE KEY cloud_thread_writer_leases_thread_id"));
+    assert!(statements.contains("heartbeat_at_ms BIGINT NOT NULL"));
+    assert!(statements.contains("expires_at_ms BIGINT NOT NULL"));
+    assert!(statements.contains("CREATE TABLE IF NOT EXISTS cloud_owner_leases"));
     assert!(statements.contains("CREATE TABLE IF NOT EXISTS cloud_fencing_tokens"));
     assert!(statements.contains("CREATE TABLE IF NOT EXISTS cloud_append_results"));
     assert!(statements.contains("request_id VARCHAR(128) NULL"));
@@ -39,6 +55,8 @@ fn mysql_schema_declares_request_lease_append_and_event_tables() {
     assert!(statements.contains("CREATE TABLE IF NOT EXISTS cloud_thread_items"));
     assert!(statements.contains("CREATE TABLE IF NOT EXISTS cloud_request_events"));
     assert!(statements.contains("UNIQUE KEY cloud_request_events_sequence"));
+    assert!(statements.contains("CREATE TABLE IF NOT EXISTS cloud_config_snapshots"));
+    assert!(statements.contains("CREATE TABLE IF NOT EXISTS cloud_state_metadata"));
 }
 
 #[test]
@@ -1432,7 +1450,375 @@ async fn mysql_store_terminal_request_with_event_updates_status_cursor_and_event
     );
 }
 
+#[tokio::test]
+#[ignore = "requires CODEX_CLOUD_STATE_MYSQL_URL pointing at an isolated MySQL test database"]
+async fn mysql_store_expired_writer_lease_is_marked_lost_before_next_request_acquires_with_mysql() {
+    let pool = mysql_pool().await;
+    let store = MysqlCloudStateStore::new(pool.clone());
+    store
+        .create_schema()
+        .await
+        .expect("create cloud state schema");
+    let unique = unique_key();
+    let first = create_request(
+        &mut MysqlCloudStateStore::new(pool.clone()),
+        &unique,
+        "idem-1",
+    )
+    .await;
+    let second = create_request(
+        &mut MysqlCloudStateStore::new(pool.clone()),
+        &unique,
+        "idem-2",
+    )
+    .await;
+
+    MysqlCloudStateStore::new(pool.clone())
+        .acquire_thread_writer_lease(&first.request_id, "owner-1")
+        .await
+        .expect("first request should acquire lease");
+    expire_writer_lease(&pool, &first.request_id).await;
+    let second_acquire = MysqlCloudStateStore::new(pool.clone())
+        .acquire_thread_writer_lease(&second.request_id, "owner-2")
+        .await
+        .expect("expired first lease should let second request acquire");
+    let first_persisted = MysqlCloudStateStore::new(pool.clone())
+        .read_request(&first.request_id)
+        .await
+        .expect("read first request");
+    let first_events = MysqlCloudStateStore::new(pool)
+        .list_request_events(&first.request_id, /*cursor*/ None, /*limit*/ 10)
+        .await
+        .expect("list first events");
+
+    assert!(matches!(
+        second_acquire,
+        LeaseAcquireOutcome::Acquired { .. }
+    ));
+    assert_eq!(first_persisted.status, RequestStatus::LeaseLost);
+    assert_eq!(
+        first_events
+            .data
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        vec!["request/lease_lost"]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires CODEX_CLOUD_STATE_MYSQL_URL pointing at an isolated MySQL test database"]
+async fn mysql_store_renews_request_leases_when_database_url_is_configured() {
+    let pool = mysql_pool().await;
+    let store = MysqlCloudStateStore::new(pool.clone());
+    store
+        .create_schema()
+        .await
+        .expect("create cloud state schema");
+    let unique = unique_key();
+    let request = create_request(
+        &mut MysqlCloudStateStore::new(pool.clone()),
+        &unique,
+        "idem-1",
+    )
+    .await;
+
+    MysqlCloudStateStore::new(pool.clone())
+        .acquire_thread_writer_lease(&request.request_id, "owner-1")
+        .await
+        .expect("request should acquire lease");
+    let before = writer_lease_expires_at(&pool, &request.request_id).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let renewed = MysqlCloudStateStore::new(pool.clone())
+        .renew_request_leases(&request.request_id, "owner-1")
+        .await
+        .expect("request leases should renew");
+    let after = writer_lease_expires_at(&pool, &request.request_id).await;
+    let persisted = MysqlCloudStateStore::new(pool)
+        .read_request(&request.request_id)
+        .await
+        .expect("read request");
+
+    assert_eq!(renewed, true);
+    assert!(after > before, "expires_at_ms should advance after renew");
+    assert_eq!(persisted.status, RequestStatus::Running);
+}
+
+#[tokio::test]
+#[ignore = "requires CODEX_CLOUD_STATE_MYSQL_URL pointing at an isolated MySQL test database"]
+async fn mysql_store_expires_owner_lease_and_releases_writer_lease_when_database_url_is_configured()
+{
+    let pool = mysql_pool().await;
+    let store = MysqlCloudStateStore::new(pool.clone());
+    store
+        .create_schema()
+        .await
+        .expect("create cloud state schema");
+    let unique = unique_key();
+    let first = create_request(
+        &mut MysqlCloudStateStore::new(pool.clone()),
+        &unique,
+        "idem-1",
+    )
+    .await;
+    let second = create_request(
+        &mut MysqlCloudStateStore::new(pool.clone()),
+        &unique,
+        "idem-2",
+    )
+    .await;
+
+    MysqlCloudStateStore::new(pool.clone())
+        .acquire_thread_writer_lease(&first.request_id, "owner-1")
+        .await
+        .expect("first request should acquire lease");
+    expire_owner_lease(&pool, &first.request_id).await;
+    let expired = MysqlCloudStateStore::new(pool.clone())
+        .expire_owner_leases()
+        .await
+        .expect("expire owner leases");
+    let second_acquire = MysqlCloudStateStore::new(pool.clone())
+        .acquire_thread_writer_lease(&second.request_id, "owner-2")
+        .await
+        .expect("second request should acquire released lease");
+    let first_persisted = MysqlCloudStateStore::new(pool.clone())
+        .read_request(&first.request_id)
+        .await
+        .expect("read first request");
+    let first_events = MysqlCloudStateStore::new(pool)
+        .list_request_events(&first.request_id, /*cursor*/ None, /*limit*/ 10)
+        .await
+        .expect("list first events");
+
+    assert_eq!(expired, 1);
+    assert_eq!(first_persisted.status, RequestStatus::OwnerTimedOut);
+    assert!(matches!(
+        second_acquire,
+        LeaseAcquireOutcome::Acquired { .. }
+    ));
+    assert_eq!(
+        first_events
+            .data
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        vec!["request/owner_timed_out"]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires CODEX_CLOUD_STATE_MYSQL_URL pointing at an isolated MySQL test database"]
+async fn mysql_thread_store_rejects_turn_append_without_active_writer_lease() {
+    let pool = mysql_pool().await;
+    let state_store = MysqlCloudStateStore::new(pool.clone());
+    state_store
+        .create_schema()
+        .await
+        .expect("create cloud state schema");
+    let thread_store = MysqlCloudThreadStore::new(MysqlCloudStateStore::new(pool.clone()));
+    let thread_id = ThreadId::new();
+    let turn_id = format!("turn-{}", unique_key());
+    let request = MysqlCloudStateStore::new(pool.clone())
+        .create_request(CreateRequestParams {
+            caller_id: "caller-1".to_string(),
+            thread_id: thread_id.to_string(),
+            idempotency_key: "idem-1".to_string(),
+            input_hash: "hash-a".to_string(),
+        })
+        .await
+        .expect("create request");
+
+    thread_store
+        .create_thread(mysql_create_thread_params(thread_id))
+        .await
+        .expect("create cloud thread");
+    MysqlCloudStateStore::new(pool.clone())
+        .set_request_turn_id(&request.request_id, &turn_id)
+        .await
+        .expect("set request turn id");
+    let append_error = thread_store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![turn_started_rollout_item(&turn_id)],
+        })
+        .await
+        .expect_err("turn append without active lease should fail");
+
+    assert!(
+        append_error.to_string().contains("active writer lease"),
+        "unexpected append error: {append_error}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires CODEX_CLOUD_STATE_MYSQL_URL pointing at an isolated MySQL test database"]
+async fn mysql_thread_store_allows_turn_append_with_active_writer_lease() {
+    let pool = mysql_pool().await;
+    let state_store = MysqlCloudStateStore::new(pool.clone());
+    state_store
+        .create_schema()
+        .await
+        .expect("create cloud state schema");
+    let thread_store = MysqlCloudThreadStore::new(MysqlCloudStateStore::new(pool.clone()));
+    let thread_id = ThreadId::new();
+    let turn_id = format!("turn-{}", unique_key());
+    let request = MysqlCloudStateStore::new(pool.clone())
+        .create_request(CreateRequestParams {
+            caller_id: "caller-1".to_string(),
+            thread_id: thread_id.to_string(),
+            idempotency_key: "idem-1".to_string(),
+            input_hash: "hash-a".to_string(),
+        })
+        .await
+        .expect("create request");
+
+    thread_store
+        .create_thread(mysql_create_thread_params(thread_id))
+        .await
+        .expect("create cloud thread");
+    MysqlCloudStateStore::new(pool.clone())
+        .acquire_thread_writer_lease(&request.request_id, "owner-1")
+        .await
+        .expect("acquire writer lease");
+    MysqlCloudStateStore::new(pool.clone())
+        .set_request_turn_id(&request.request_id, &turn_id)
+        .await
+        .expect("set request turn id");
+
+    thread_store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![turn_started_rollout_item(&turn_id)],
+        })
+        .await
+        .expect("turn append with active lease should succeed");
+}
+
+#[tokio::test]
+#[ignore = "requires CODEX_CLOUD_STATE_MYSQL_URL pointing at an isolated MySQL test database"]
+async fn mysql_store_expired_writer_lease_cannot_write_completed_terminal_with_mysql() {
+    let pool = mysql_pool().await;
+    let store = MysqlCloudStateStore::new(pool.clone());
+    store
+        .create_schema()
+        .await
+        .expect("create cloud state schema");
+    let unique = unique_key();
+    let request = create_request(
+        &mut MysqlCloudStateStore::new(pool.clone()),
+        &unique,
+        "idem-1",
+    )
+    .await;
+
+    MysqlCloudStateStore::new(pool.clone())
+        .acquire_thread_writer_lease(&request.request_id, "owner-1")
+        .await
+        .expect("request should acquire lease");
+    expire_writer_lease(&pool, &request.request_id).await;
+    let update = MysqlCloudStateStore::new(pool.clone())
+        .mark_request_terminal_with_event(
+            EventAppendParams {
+                request_id: request.request_id.clone(),
+                event_type: "request/completed".to_string(),
+                payload_inline: "{}".to_string(),
+            },
+            RequestStatus::Completed,
+        )
+        .await
+        .expect("stale completed terminal should be converted to lease_lost");
+    let persisted = MysqlCloudStateStore::new(pool.clone())
+        .read_request(&request.request_id)
+        .await
+        .expect("read request");
+    let events = MysqlCloudStateStore::new(pool)
+        .list_request_events(&request.request_id, /*cursor*/ None, /*limit*/ 10)
+        .await
+        .expect("list request events");
+
+    assert_eq!(update, TerminalStatusUpdate::Changed);
+    assert_eq!(persisted.status, RequestStatus::LeaseLost);
+    assert_eq!(
+        events
+            .data
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        vec!["request/lease_lost"]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires CODEX_CLOUD_STATE_MYSQL_URL pointing at an isolated MySQL test database"]
+async fn mysql_store_persists_config_snapshot_and_state_metadata_when_database_url_is_configured() {
+    let pool = mysql_pool().await;
+    let store = MysqlCloudStateStore::new(pool.clone());
+    store
+        .create_schema()
+        .await
+        .expect("create cloud state schema");
+    let unique = unique_key();
+    let request = create_request(
+        &mut MysqlCloudStateStore::new(pool.clone()),
+        &unique,
+        "idem-1",
+    )
+    .await;
+    let config_snapshot = crate::ConfigSnapshotRecord {
+        request_id: request.request_id.clone(),
+        thread_id: request.thread_id.clone(),
+        config_json: r#"{"model":"mock-model","runtimeProfile":"read_only"}"#.to_string(),
+    };
+    let state_metadata = crate::StateMetadataRecord {
+        thread_id: request.thread_id.clone(),
+        kind: "thread_effective_settings".to_string(),
+        payload_json: r#"{"cwd":"/tmp/work","memoryMode":"disabled"}"#.to_string(),
+    };
+
+    MysqlCloudStateStore::new(pool.clone())
+        .persist_config_snapshot(config_snapshot.clone())
+        .await
+        .expect("persist config snapshot");
+    MysqlCloudStateStore::new(pool.clone())
+        .upsert_state_metadata(state_metadata.clone())
+        .await
+        .expect("persist state metadata");
+
+    assert_eq!(
+        MysqlCloudStateStore::new(pool.clone())
+            .read_config_snapshot(&request.request_id)
+            .await
+            .expect("read config snapshot"),
+        crate::ConfigSnapshotRecord {
+            config_json: r#"{"model": "mock-model", "runtimeProfile": "read_only"}"#.to_string(),
+            ..config_snapshot
+        }
+    );
+    assert_eq!(
+        MysqlCloudStateStore::new(pool)
+            .read_state_metadata(&request.thread_id, "thread_effective_settings")
+            .await
+            .expect("read state metadata"),
+        crate::StateMetadataRecord {
+            payload_json: r#"{"cwd": "/tmp/work", "memoryMode": "disabled"}"#.to_string(),
+            ..state_metadata
+        }
+    );
+}
+
 async fn clear_mysql_state(pool: &MySqlPool) {
+    sqlx::query("DELETE FROM cloud_state_metadata")
+        .execute(pool)
+        .await
+        .expect("clear cloud_state_metadata");
+    sqlx::query("DELETE FROM cloud_config_snapshots")
+        .execute(pool)
+        .await
+        .expect("clear cloud_config_snapshots");
+    sqlx::query("DELETE FROM cloud_owner_leases")
+        .execute(pool)
+        .await
+        .expect("clear cloud_owner_leases");
     sqlx::query("DELETE FROM cloud_request_events")
         .execute(pool)
         .await
@@ -1485,6 +1871,64 @@ async fn create_request(
         })
         .await
         .expect("create request")
+}
+
+async fn expire_writer_lease(pool: &MySqlPool, request_id: &str) {
+    sqlx::query(
+        "UPDATE cloud_thread_writer_leases SET heartbeat_at_ms = 0, expires_at_ms = 0 WHERE request_id = ?",
+    )
+    .bind(request_id)
+    .execute(pool)
+    .await
+    .expect("expire writer lease");
+}
+
+async fn expire_owner_lease(pool: &MySqlPool, request_id: &str) {
+    sqlx::query(
+        "UPDATE cloud_owner_leases SET heartbeat_at_ms = 0, expires_at_ms = 0 WHERE request_id = ?",
+    )
+    .bind(request_id)
+    .execute(pool)
+    .await
+    .expect("expire owner lease");
+}
+
+async fn writer_lease_expires_at(pool: &MySqlPool, request_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT expires_at_ms FROM cloud_thread_writer_leases WHERE request_id = ?")
+        .bind(request_id)
+        .fetch_one(pool)
+        .await
+        .expect("read writer lease expires_at_ms")
+}
+
+fn mysql_create_thread_params(thread_id: ThreadId) -> CreateThreadParams {
+    CreateThreadParams {
+        thread_id,
+        forked_from_id: None,
+        parent_thread_id: None,
+        source: SessionSource::Cli,
+        thread_source: None,
+        base_instructions: BaseInstructions::default(),
+        dynamic_tools: Vec::new(),
+        multi_agent_version: None,
+        metadata: ThreadPersistenceMetadata {
+            cwd: None,
+            model_provider: "test-provider".to_string(),
+            memory_mode: ThreadMemoryMode::Disabled,
+        },
+    }
+}
+
+fn turn_started_rollout_item(turn_id: &str) -> RolloutItem {
+    RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::TurnStarted(
+        TurnStartedEvent {
+            turn_id: turn_id.to_string(),
+            trace_id: None,
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+        },
+    ))
 }
 
 async fn append_with_key(

@@ -16,6 +16,7 @@ use codex_core_api::AskForApproval;
 use codex_core_api::AuthCredentialsStoreMode;
 use codex_core_api::AuthManager;
 use codex_core_api::AutoCompactTokenLimitScope;
+use codex_core_api::CloudRuntimeConfig;
 use codex_core_api::CodexThread;
 use codex_core_api::Config;
 use codex_core_api::ConfigLayerStack;
@@ -278,6 +279,7 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         disable_paste_burst: false,
         analytics_enabled: Some(false),
         feedback_enabled: false,
+        cloud_runtime: CloudRuntimeConfig::default(),
         tool_suggest: ToolSuggestConfig::default(),
         otel: OtelConfig::default(),
     };

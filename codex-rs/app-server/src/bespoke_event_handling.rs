@@ -83,6 +83,7 @@ use codex_app_server_protocol::WarningNotification;
 use codex_app_server_protocol::build_item_from_guardian_event;
 use codex_app_server_protocol::guardian_auto_approval_review_notification;
 use codex_app_server_protocol::item_event_to_server_notification;
+use codex_cloud_wrapper_protocol::TerminalSignal;
 use codex_core::CodexThread;
 use codex_core::ThreadManager;
 use codex_core::review_format::format_review_findings_block;
@@ -119,6 +120,8 @@ use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tracing::error;
 
+const CLOUD_REQUEST_EVENT_PAYLOAD_INLINE_MAX_BYTES: usize = 64 * 1024;
+
 enum CommandExecutionApprovalPresentation {
     Network(V2NetworkApprovalContext),
     Command(CommandExecutionCompletionItem),
@@ -142,6 +145,7 @@ pub(crate) async fn apply_bespoke_event_handling(
     thread_watch_manager: ThreadWatchManager,
     thread_list_state_permit: Arc<tokio::sync::Semaphore>,
     fallback_model_provider: String,
+    cloud_wrapper_processor: Option<Arc<crate::request_processors::CloudWrapperRequestProcessor>>,
 ) {
     let Event {
         id: event_turn_id,
@@ -174,9 +178,13 @@ pub(crate) async fn apply_bespoke_event_handling(
                 thread_id: conversation_id.to_string(),
                 turn,
             };
-            outgoing
-                .send_server_notification(ServerNotification::TurnStarted(notification))
-                .await;
+            send_persisted_server_notification(
+                &outgoing,
+                cloud_wrapper_processor.as_deref(),
+                &event_turn_id,
+                ServerNotification::TurnStarted(notification),
+            )
+            .await;
         }
         EventMsg::TurnComplete(turn_complete_event) => {
             // All per-thread requests are bound to a turn, so abort them.
@@ -192,6 +200,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 turn_complete_event,
                 &outgoing,
                 &thread_state,
+                cloud_wrapper_processor.as_deref(),
             )
             .await;
         }
@@ -805,9 +814,13 @@ pub(crate) async fn apply_bespoke_event_handling(
                 started_at_ms: request.started_at_ms,
                 item,
             };
-            outgoing
-                .send_server_notification(ServerNotification::ItemStarted(notification))
-                .await;
+            send_persisted_server_notification(
+                &outgoing,
+                cloud_wrapper_processor.as_deref(),
+                &turn_id,
+                ServerNotification::ItemStarted(notification),
+            )
+            .await;
             let params = DynamicToolCallParams {
                 thread_id: conversation_id.to_string(),
                 turn_id: turn_id.clone(),
@@ -847,7 +860,13 @@ pub(crate) async fn apply_bespoke_event_handling(
                 &conversation_id.to_string(),
                 &event_turn_id,
             );
-            outgoing.send_server_notification(notification).await;
+            send_persisted_server_notification(
+                &outgoing,
+                cloud_wrapper_processor.as_deref(),
+                &event_turn_id,
+                notification,
+            )
+            .await;
         }
         EventMsg::CollabCloseEnd(end_event) => {
             if thread_manager
@@ -864,7 +883,13 @@ pub(crate) async fn apply_bespoke_event_handling(
                 &conversation_id.to_string(),
                 &event_turn_id,
             );
-            outgoing.send_server_notification(notification).await;
+            send_persisted_server_notification(
+                &outgoing,
+                cloud_wrapper_processor.as_deref(),
+                &event_turn_id,
+                notification,
+            )
+            .await;
         }
         EventMsg::ContextCompacted(..) => {
             // Core still fans out this deprecated event for legacy clients;
@@ -958,18 +983,26 @@ pub(crate) async fn apply_bespoke_event_handling(
                 started_at_ms: now_unix_timestamp_ms(),
                 item: item.clone(),
             };
-            outgoing
-                .send_server_notification(ServerNotification::ItemStarted(started))
-                .await;
+            send_persisted_server_notification(
+                &outgoing,
+                cloud_wrapper_processor.as_deref(),
+                &event_turn_id,
+                ServerNotification::ItemStarted(started),
+            )
+            .await;
             let completed = ItemCompletedNotification {
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 completed_at_ms: now_unix_timestamp_ms(),
                 item,
             };
-            outgoing
-                .send_server_notification(ServerNotification::ItemCompleted(completed))
-                .await;
+            send_persisted_server_notification(
+                &outgoing,
+                cloud_wrapper_processor.as_deref(),
+                &event_turn_id,
+                ServerNotification::ItemCompleted(completed),
+            )
+            .await;
         }
         msg @ (EventMsg::ItemStarted(_)
         | EventMsg::ItemCompleted(_)
@@ -980,27 +1013,45 @@ pub(crate) async fn apply_bespoke_event_handling(
                 &conversation_id.to_string(),
                 &event_turn_id,
             );
-            outgoing.send_server_notification(notification).await;
+            send_persisted_server_notification(
+                &outgoing,
+                cloud_wrapper_processor.as_deref(),
+                &event_turn_id,
+                notification,
+            )
+            .await;
         }
         EventMsg::HookStarted(event) => {
+            let turn_id = event.turn_id.clone();
+            let persist_turn_id = turn_id.as_deref().unwrap_or(&event_turn_id);
             let notification = HookStartedNotification {
                 thread_id: conversation_id.to_string(),
-                turn_id: event.turn_id,
+                turn_id: turn_id.clone(),
                 run: event.run.into(),
             };
-            outgoing
-                .send_server_notification(ServerNotification::HookStarted(notification))
-                .await;
+            send_persisted_server_notification(
+                &outgoing,
+                cloud_wrapper_processor.as_deref(),
+                persist_turn_id,
+                ServerNotification::HookStarted(notification),
+            )
+            .await;
         }
         EventMsg::HookCompleted(event) => {
+            let turn_id = event.turn_id.clone();
+            let persist_turn_id = turn_id.as_deref().unwrap_or(&event_turn_id);
             let notification = HookCompletedNotification {
                 thread_id: conversation_id.to_string(),
-                turn_id: event.turn_id,
+                turn_id: turn_id.clone(),
                 run: event.run.into(),
             };
-            outgoing
-                .send_server_notification(ServerNotification::HookCompleted(notification))
-                .await;
+            send_persisted_server_notification(
+                &outgoing,
+                cloud_wrapper_processor.as_deref(),
+                persist_turn_id,
+                ServerNotification::HookCompleted(notification),
+            )
+            .await;
         }
         EventMsg::ExitedReviewMode(review_event) => {
             let review = match review_event.review_output {
@@ -1017,18 +1068,26 @@ pub(crate) async fn apply_bespoke_event_handling(
                 started_at_ms: now_unix_timestamp_ms(),
                 item: item.clone(),
             };
-            outgoing
-                .send_server_notification(ServerNotification::ItemStarted(started))
-                .await;
+            send_persisted_server_notification(
+                &outgoing,
+                cloud_wrapper_processor.as_deref(),
+                &event_turn_id,
+                ServerNotification::ItemStarted(started),
+            )
+            .await;
             let completed = ItemCompletedNotification {
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 completed_at_ms: now_unix_timestamp_ms(),
                 item,
             };
-            outgoing
-                .send_server_notification(ServerNotification::ItemCompleted(completed))
-                .await;
+            send_persisted_server_notification(
+                &outgoing,
+                cloud_wrapper_processor.as_deref(),
+                &event_turn_id,
+                ServerNotification::ItemCompleted(completed),
+            )
+            .await;
         }
         EventMsg::RawResponseItem(raw_response_item_event) => {
             maybe_emit_hook_prompt_item_completed(
@@ -1036,6 +1095,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 &event_turn_id,
                 &raw_response_item_event.item,
                 &outgoing,
+                cloud_wrapper_processor.as_deref(),
             )
             .await;
             maybe_emit_raw_response_item_completed(
@@ -1043,6 +1103,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 &event_turn_id,
                 raw_response_item_event.item,
                 &outgoing,
+                cloud_wrapper_processor.as_deref(),
             )
             .await;
         }
@@ -1074,7 +1135,13 @@ pub(crate) async fn apply_bespoke_event_handling(
                     &conversation_id.to_string(),
                     &event_turn_id,
                 );
-                outgoing.send_server_notification(notification).await;
+                send_persisted_server_notification(
+                    &outgoing,
+                    cloud_wrapper_processor.as_deref(),
+                    &event_turn_id,
+                    notification,
+                )
+                .await;
             }
         }
         EventMsg::ExecCommandOutputDelta(exec_command_output_delta_event) => {
@@ -1083,7 +1150,13 @@ pub(crate) async fn apply_bespoke_event_handling(
                 &conversation_id.to_string(),
                 &event_turn_id,
             );
-            outgoing.send_server_notification(notification).await;
+            send_persisted_server_notification(
+                &outgoing,
+                cloud_wrapper_processor.as_deref(),
+                &event_turn_id,
+                notification,
+            )
+            .await;
         }
         EventMsg::ExecCommandEnd(exec_command_end_event) => {
             let call_id = exec_command_end_event.call_id.clone();
@@ -1108,7 +1181,13 @@ pub(crate) async fn apply_bespoke_event_handling(
                 &conversation_id.to_string(),
                 &event_turn_id,
             );
-            outgoing.send_server_notification(notification).await;
+            send_persisted_server_notification(
+                &outgoing,
+                cloud_wrapper_processor.as_deref(),
+                &event_turn_id,
+                notification,
+            )
+            .await;
         }
         // If this is a TurnAborted, reply to any pending interrupt requests.
         EventMsg::TurnAborted(turn_aborted_event) => {
@@ -1125,6 +1204,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 turn_aborted_event,
                 &outgoing,
                 &thread_state,
+                cloud_wrapper_processor.as_deref(),
             )
             .await;
         }
@@ -1222,7 +1302,14 @@ pub(crate) async fn apply_bespoke_event_handling(
             }
         }
         EventMsg::TurnDiff(turn_diff_event) => {
-            handle_turn_diff(conversation_id, &event_turn_id, turn_diff_event, &outgoing).await;
+            handle_turn_diff(
+                conversation_id,
+                &event_turn_id,
+                turn_diff_event,
+                &outgoing,
+                cloud_wrapper_processor.as_deref(),
+            )
+            .await;
         }
         EventMsg::PlanUpdate(plan_update_event) => {
             handle_turn_plan_update(
@@ -1230,6 +1317,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 &event_turn_id,
                 plan_update_event,
                 &outgoing,
+                cloud_wrapper_processor.as_deref(),
             )
             .await;
         }
@@ -1248,15 +1336,20 @@ async fn handle_turn_diff(
     event_turn_id: &str,
     turn_diff_event: TurnDiffEvent,
     outgoing: &ThreadScopedOutgoingMessageSender,
+    cloud_wrapper_processor: Option<&crate::request_processors::CloudWrapperRequestProcessor>,
 ) {
     let notification = TurnDiffUpdatedNotification {
         thread_id: conversation_id.to_string(),
         turn_id: event_turn_id.to_string(),
         diff: turn_diff_event.unified_diff,
     };
-    outgoing
-        .send_server_notification(ServerNotification::TurnDiffUpdated(notification))
-        .await;
+    send_persisted_server_notification(
+        outgoing,
+        cloud_wrapper_processor,
+        event_turn_id,
+        ServerNotification::TurnDiffUpdated(notification),
+    )
+    .await;
 }
 
 async fn handle_turn_plan_update(
@@ -1264,6 +1357,7 @@ async fn handle_turn_plan_update(
     event_turn_id: &str,
     plan_update_event: UpdatePlanArgs,
     outgoing: &ThreadScopedOutgoingMessageSender,
+    cloud_wrapper_processor: Option<&crate::request_processors::CloudWrapperRequestProcessor>,
 ) {
     // `update_plan` is a todo/checklist tool; it is not related to plan-mode updates
     let notification = TurnPlanUpdatedNotification {
@@ -1276,9 +1370,13 @@ async fn handle_turn_plan_update(
             .map(TurnPlanStep::from)
             .collect(),
     };
-    outgoing
-        .send_server_notification(ServerNotification::TurnPlanUpdated(notification))
-        .await;
+    send_persisted_server_notification(
+        outgoing,
+        cloud_wrapper_processor,
+        event_turn_id,
+        ServerNotification::TurnPlanUpdated(notification),
+    )
+    .await;
 }
 
 struct TurnCompletionMetadata {
@@ -1409,15 +1507,20 @@ async fn maybe_emit_raw_response_item_completed(
     turn_id: &str,
     item: codex_protocol::models::ResponseItem,
     outgoing: &ThreadScopedOutgoingMessageSender,
+    cloud_wrapper_processor: Option<&crate::request_processors::CloudWrapperRequestProcessor>,
 ) {
     let notification = RawResponseItemCompletedNotification {
         thread_id: conversation_id.to_string(),
         turn_id: turn_id.to_string(),
         item,
     };
-    outgoing
-        .send_server_notification(ServerNotification::RawResponseItemCompleted(notification))
-        .await;
+    send_persisted_server_notification(
+        outgoing,
+        cloud_wrapper_processor,
+        turn_id,
+        ServerNotification::RawResponseItemCompleted(notification),
+    )
+    .await;
 }
 
 pub(crate) async fn maybe_emit_hook_prompt_item_completed(
@@ -1425,6 +1528,7 @@ pub(crate) async fn maybe_emit_hook_prompt_item_completed(
     turn_id: &str,
     item: &codex_protocol::models::ResponseItem,
     outgoing: &ThreadScopedOutgoingMessageSender,
+    cloud_wrapper_processor: Option<&crate::request_processors::CloudWrapperRequestProcessor>,
 ) {
     let codex_protocol::models::ResponseItem::Message {
         role, content, id, ..
@@ -1454,9 +1558,13 @@ pub(crate) async fn maybe_emit_hook_prompt_item_completed(
                 .collect(),
         },
     };
-    outgoing
-        .send_server_notification(ServerNotification::ItemCompleted(notification))
-        .await;
+    send_persisted_server_notification(
+        outgoing,
+        cloud_wrapper_processor,
+        turn_id,
+        ServerNotification::ItemCompleted(notification),
+    )
+    .await;
 }
 
 async fn find_and_remove_turn_summary(
@@ -1473,6 +1581,7 @@ async fn handle_turn_complete(
     turn_complete_event: TurnCompleteEvent,
     outgoing: &ThreadScopedOutgoingMessageSender,
     thread_state: &Arc<Mutex<ThreadState>>,
+    cloud_wrapper_processor: Option<&crate::request_processors::CloudWrapperRequestProcessor>,
 ) {
     let turn_summary = find_and_remove_turn_summary(conversation_id, thread_state).await;
 
@@ -1483,7 +1592,7 @@ async fn handle_turn_complete(
 
     emit_turn_completed_with_status(
         conversation_id,
-        event_turn_id,
+        event_turn_id.clone(),
         TurnCompletionMetadata {
             status,
             error,
@@ -1494,6 +1603,13 @@ async fn handle_turn_complete(
         outgoing,
     )
     .await;
+    persist_cloud_request_terminal(
+        cloud_wrapper_processor,
+        &event_turn_id,
+        TerminalSignal::Completed,
+        None,
+    )
+    .await;
 }
 
 async fn handle_turn_interrupted(
@@ -1502,12 +1618,13 @@ async fn handle_turn_interrupted(
     turn_aborted_event: TurnAbortedEvent,
     outgoing: &ThreadScopedOutgoingMessageSender,
     thread_state: &Arc<Mutex<ThreadState>>,
+    cloud_wrapper_processor: Option<&crate::request_processors::CloudWrapperRequestProcessor>,
 ) {
     let turn_summary = find_and_remove_turn_summary(conversation_id, thread_state).await;
 
     emit_turn_completed_with_status(
         conversation_id,
-        event_turn_id,
+        event_turn_id.clone(),
         TurnCompletionMetadata {
             status: TurnStatus::Interrupted,
             error: None,
@@ -1518,6 +1635,97 @@ async fn handle_turn_interrupted(
         outgoing,
     )
     .await;
+    persist_cloud_request_terminal(
+        cloud_wrapper_processor,
+        &event_turn_id,
+        TerminalSignal::Interrupted,
+        None,
+    )
+    .await;
+}
+
+async fn persist_cloud_request_terminal(
+    cloud_wrapper_processor: Option<&crate::request_processors::CloudWrapperRequestProcessor>,
+    turn_id: &str,
+    signal: TerminalSignal,
+    payload_inline: Option<String>,
+) {
+    let Some(cloud_wrapper_processor) = cloud_wrapper_processor else {
+        return;
+    };
+    if let Err(err) = cloud_wrapper_processor
+        .terminal_for_turn_id(turn_id, signal, payload_inline)
+        .await
+    {
+        tracing::debug!(
+            turn_id,
+            "turn terminal event did not match a cloud wrapper request: {}",
+            err.message
+        );
+    }
+}
+
+async fn send_persisted_server_notification(
+    outgoing: &ThreadScopedOutgoingMessageSender,
+    cloud_wrapper_processor: Option<&crate::request_processors::CloudWrapperRequestProcessor>,
+    turn_id: &str,
+    notification: ServerNotification,
+) {
+    persist_cloud_request_notification(cloud_wrapper_processor, turn_id, &notification).await;
+    outgoing.send_server_notification(notification).await;
+}
+
+async fn persist_cloud_request_notification(
+    cloud_wrapper_processor: Option<&crate::request_processors::CloudWrapperRequestProcessor>,
+    turn_id: &str,
+    notification: &ServerNotification,
+) {
+    let Some(cloud_wrapper_processor) = cloud_wrapper_processor else {
+        return;
+    };
+    let notification_json = match serde_json::to_value(notification) {
+        Ok(notification_json) => notification_json,
+        Err(err) => {
+            tracing::debug!(
+                turn_id,
+                "failed to serialize notification for request event: {err}"
+            );
+            return;
+        }
+    };
+    let method = notification_json
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("notification")
+        .to_string();
+    let payload_inline = cloud_request_notification_payload_inline(&method, notification_json);
+    if let Err(err) = cloud_wrapper_processor
+        .append_event_for_turn_id(turn_id, format!("notification/{method}"), payload_inline)
+        .await
+    {
+        tracing::debug!(
+            turn_id,
+            "turn notification event did not match a cloud wrapper request: {}",
+            err.message
+        );
+    }
+}
+
+fn cloud_request_notification_payload_inline(
+    method: &str,
+    notification_json: serde_json::Value,
+) -> String {
+    let payload = serde_json::json!({ "notification": notification_json });
+    let payload_inline = payload.to_string();
+    if payload_inline.len() <= CLOUD_REQUEST_EVENT_PAYLOAD_INLINE_MAX_BYTES {
+        return payload_inline;
+    }
+    serde_json::json!({
+        "method": method,
+        "truncated": true,
+        "originalBytes": payload_inline.len(),
+    })
+    .to_string()
 }
 
 async fn handle_thread_rollback_failed(
@@ -2320,6 +2528,7 @@ mod tests {
                 self.thread_watch_manager.clone(),
                 Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
                 "test-provider".to_string(),
+                None,
             )
             .await;
         }
@@ -3271,6 +3480,7 @@ mod tests {
             thread_watch_manager,
             Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
             "test-provider".to_string(),
+            None,
         )
         .await;
 
@@ -3325,6 +3535,7 @@ mod tests {
             turn_complete_event(&event_turn_id),
             &outgoing,
             &thread_state,
+            None,
         )
         .await;
 
@@ -3378,6 +3589,7 @@ mod tests {
             turn_aborted_event(&event_turn_id),
             &outgoing,
             &thread_state,
+            None,
         )
         .await;
 
@@ -3428,6 +3640,7 @@ mod tests {
             turn_complete_event(&event_turn_id),
             &outgoing,
             &thread_state,
+            None,
         )
         .await;
 
@@ -3481,7 +3694,7 @@ mod tests {
 
         let conversation_id = ThreadId::new();
 
-        handle_turn_plan_update(conversation_id, "turn-123", update, &outgoing).await;
+        handle_turn_plan_update(conversation_id, "turn-123", update, &outgoing, None).await;
 
         let msg = recv_broadcast_message(&mut rx).await?;
         match msg {
@@ -3663,6 +3876,7 @@ mod tests {
             turn_complete_event(&a_turn1),
             &outgoing,
             &thread_state,
+            None,
         )
         .await;
 
@@ -3684,6 +3898,7 @@ mod tests {
             turn_complete_event(&b_turn1),
             &outgoing,
             &thread_state,
+            None,
         )
         .await;
 
@@ -3695,6 +3910,7 @@ mod tests {
             turn_complete_event(&a_turn2),
             &outgoing,
             &thread_state,
+            None,
         )
         .await;
 
@@ -3771,6 +3987,7 @@ mod tests {
                 unified_diff: unified_diff.clone(),
             },
             &outgoing,
+            None,
         )
         .await;
 
@@ -3808,7 +4025,8 @@ mod tests {
         ])
         .expect("hook prompt message");
 
-        maybe_emit_hook_prompt_item_completed(conversation_id, "turn-1", &item, &outgoing).await;
+        maybe_emit_hook_prompt_item_completed(conversation_id, "turn-1", &item, &outgoing, None)
+            .await;
 
         let msg = recv_broadcast_message(&mut rx).await?;
         match msg {

@@ -1,10 +1,13 @@
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_cloud_state::CloudRequestServiceRuntime;
 use codex_cloud_state::CloudStateError;
+use codex_cloud_state::ConfigSnapshotRecord;
+use codex_cloud_state::StateMetadataRecord;
 use codex_cloud_wrapper_protocol::AppendThreadItemsWithLeaseParams;
 use codex_cloud_wrapper_protocol::AppendThreadItemsWithLeaseResponse;
 use codex_cloud_wrapper_protocol::RequestCancelParams;
 use codex_cloud_wrapper_protocol::RequestCancelResponse;
+use codex_cloud_wrapper_protocol::RequestEvent;
 use codex_cloud_wrapper_protocol::RequestEventsListParams;
 use codex_cloud_wrapper_protocol::RequestEventsListResponse;
 use codex_cloud_wrapper_protocol::RequestReadParams;
@@ -13,6 +16,7 @@ use codex_cloud_wrapper_protocol::RequestRunParams;
 use codex_cloud_wrapper_protocol::RequestRunResponse;
 use codex_cloud_wrapper_protocol::RequestTerminalParams;
 use codex_cloud_wrapper_protocol::RequestTerminalResponse;
+use codex_cloud_wrapper_protocol::TerminalSignal;
 use codex_cloud_wrapper_protocol::ThreadItemsListParams;
 use codex_cloud_wrapper_protocol::ThreadItemsListResponse;
 use codex_core::config::CloudRuntimeStateStore;
@@ -75,6 +79,46 @@ impl CloudWrapperRequestProcessor {
             .map_err(cloud_state_error)
     }
 
+    pub(crate) async fn set_turn_id(
+        &self,
+        caller_id: &str,
+        request_id: &str,
+        turn_id: &str,
+    ) -> Result<RequestReadResponse, JSONRPCErrorError> {
+        let mut request_service = self.request_service.lock().await;
+        let request_service = request_service.service_mut().await?;
+        let request = request_service
+            .set_turn_id(caller_id, request_id, turn_id)
+            .await
+            .map_err(cloud_state_error)?;
+        Ok(RequestReadResponse {
+            latest_event_cursor: request.latest_event_cursor,
+            request: request.to_protocol(),
+        })
+    }
+
+    pub(crate) async fn renew_request_leases(
+        &self,
+        request_id: &str,
+        owner_instance_id: &str,
+    ) -> Result<bool, JSONRPCErrorError> {
+        let mut request_service = self.request_service.lock().await;
+        let request_service = request_service.service_mut().await?;
+        request_service
+            .renew_request_leases(request_id, owner_instance_id)
+            .await
+            .map_err(cloud_state_error)
+    }
+
+    pub(crate) async fn expire_owner_leases(&self) -> Result<usize, JSONRPCErrorError> {
+        let mut request_service = self.request_service.lock().await;
+        let request_service = request_service.service_mut().await?;
+        request_service
+            .expire_owner_leases()
+            .await
+            .map_err(cloud_state_error)
+    }
+
     pub(crate) async fn thread_append_with_lease(
         &self,
         caller_id: &str,
@@ -127,6 +171,34 @@ impl CloudWrapperRequestProcessor {
             .map_err(cloud_state_error)
     }
 
+    pub(crate) async fn terminal_for_turn_id(
+        &self,
+        turn_id: &str,
+        signal: TerminalSignal,
+        payload_inline: Option<String>,
+    ) -> Result<RequestTerminalResponse, JSONRPCErrorError> {
+        let mut request_service = self.request_service.lock().await;
+        let request_service = request_service.service_mut().await?;
+        request_service
+            .terminal_for_turn_id(turn_id, signal, payload_inline)
+            .await
+            .map_err(cloud_state_error)
+    }
+
+    pub(crate) async fn append_event_for_turn_id(
+        &self,
+        turn_id: &str,
+        event_type: String,
+        payload_inline: String,
+    ) -> Result<RequestEvent, JSONRPCErrorError> {
+        let mut request_service = self.request_service.lock().await;
+        let request_service = request_service.service_mut().await?;
+        request_service
+            .append_event_for_turn_id(turn_id, event_type, payload_inline)
+            .await
+            .map_err(cloud_state_error)
+    }
+
     pub(crate) async fn request_events_list(
         &self,
         caller_id: &str,
@@ -136,6 +208,20 @@ impl CloudWrapperRequestProcessor {
         let request_service = request_service.service_mut().await?;
         request_service
             .events_list(caller_id, params)
+            .await
+            .map_err(cloud_state_error)
+    }
+
+    pub(crate) async fn persist_request_context(
+        &self,
+        caller_id: &str,
+        config_snapshot: ConfigSnapshotRecord,
+        state_metadata: StateMetadataRecord,
+    ) -> Result<(), JSONRPCErrorError> {
+        let mut request_service = self.request_service.lock().await;
+        let request_service = request_service.service_mut().await?;
+        request_service
+            .persist_request_context(caller_id, config_snapshot, state_metadata)
             .await
             .map_err(cloud_state_error)
     }

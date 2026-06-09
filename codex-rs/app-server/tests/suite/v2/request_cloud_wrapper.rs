@@ -1,6 +1,8 @@
 use anyhow::Context;
 use anyhow::Result;
 use app_test_support::TestAppServer;
+use app_test_support::create_final_assistant_message_sse_response;
+use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::to_response;
 use codex_app_server::INVALID_PARAMS_ERROR_CODE;
@@ -8,6 +10,8 @@ use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ThreadStartParams;
+use codex_app_server_protocol::ThreadStartResponse;
 use codex_cloud_state::CloudStateStore;
 use codex_cloud_state::MysqlCloudStateStore;
 use codex_cloud_wrapper_protocol::AppendThreadItemsWithLeaseResponse;
@@ -24,8 +28,249 @@ use std::path::Path;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tempfile::TempDir;
+use tokio::time::Duration;
+use tokio::time::timeout;
 
 const MYSQL_URL_ENV_VAR: &str = "CODEX_CLOUD_STATE_MYSQL_URL";
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[tokio::test]
+#[ignore = "requires CODEX_CLOUD_STATE_MYSQL_URL pointing at an isolated MySQL test database"]
+async fn request_run_creates_thread_and_resumes_on_another_mysql_app_server_node() -> Result<()> {
+    let database_url = std::env::var(MYSQL_URL_ENV_VAR)
+        .context("CODEX_CLOUD_STATE_MYSQL_URL must be set to run this ignored test")?;
+    let server = create_mock_responses_server_sequence(vec![
+        create_final_assistant_message_sse_response("created thread completed")?,
+        create_final_assistant_message_sse_response("created thread resumed")?,
+    ])
+    .await;
+    let first_codex_home = TempDir::new()?;
+    let second_codex_home = TempDir::new()?;
+    create_config_toml(first_codex_home.path(), &server.uri())?;
+    create_config_toml(second_codex_home.path(), &server.uri())?;
+    let env = [(MYSQL_URL_ENV_VAR, Some(database_url.as_str()))];
+    let test_id = unique_test_id();
+
+    let (thread_id, first_request_id) = {
+        let mut first_node = TestAppServer::new_with_env(first_codex_home.path(), &env).await?;
+        first_node.initialize().await?;
+        let first_run = run_new_thread_request(
+            &mut first_node,
+            &format!("create stateless thread {test_id}"),
+            &format!("idem-{test_id}-create"),
+        )
+        .await?;
+        let first_turn_id = first_run
+            .request
+            .turn_id
+            .clone()
+            .expect("request/run should create a thread and start a real turn");
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            first_node.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+        let first_read =
+            wait_for_request_status(&mut first_node, &first_run.request.request_id).await?;
+        assert_eq!(first_read.request.status, RequestStatus::Completed);
+        assert_eq!(
+            first_read.request.turn_id.as_deref(),
+            Some(first_turn_id.as_str())
+        );
+        (first_run.thread_id, first_run.request.request_id)
+    };
+
+    let mut second_node = TestAppServer::new_with_env(second_codex_home.path(), &env).await?;
+    second_node.initialize().await?;
+    let first_events = list_events_page(
+        &mut second_node,
+        &first_request_id,
+        /*cursor*/ None,
+        /*limit*/ 100,
+    )
+    .await?;
+    assert!(
+        first_events
+            .data
+            .iter()
+            .any(|event| event.event_type.starts_with("notification/")
+                && event.payload_inline.contains("created thread completed")),
+        "second node should read first node assistant output from persisted request events: {first_events:?}"
+    );
+
+    let second_run = run_real_request(
+        &mut second_node,
+        &thread_id,
+        &format!("resume created stateless thread {test_id}"),
+        &format!("idem-{test_id}-resume"),
+    )
+    .await?;
+    assert_ne!(second_run.request.request_id, first_request_id);
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        second_node.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    let second_read =
+        wait_for_request_status(&mut second_node, &second_run.request.request_id).await?;
+    assert_eq!(second_read.request.status, RequestStatus::Completed);
+
+    let cloud_store = MysqlCloudStateStore::from_database_url(&database_url).await?;
+    let first_config = cloud_store
+        .read_config_snapshot(&first_request_id)
+        .await
+        .context("first request config snapshot should be persisted in MySQL")?;
+    let second_config = cloud_store
+        .read_config_snapshot(&second_run.request.request_id)
+        .await
+        .context("second request config snapshot should be persisted in MySQL")?;
+    let state_metadata = cloud_store
+        .read_state_metadata(&thread_id, "thread_effective_settings")
+        .await
+        .context("thread state metadata should be persisted in MySQL")?;
+    assert_eq!(first_config.thread_id, thread_id);
+    assert_eq!(second_config.thread_id, thread_id);
+    assert!(
+        first_config.config_json.contains("threadSettings"),
+        "first config snapshot should include effective thread settings: {}",
+        first_config.config_json
+    );
+    assert!(
+        second_config.config_json.contains("threadSettings"),
+        "second config snapshot should include effective thread settings: {}",
+        second_config.config_json
+    );
+    assert!(
+        state_metadata.payload_json.contains("mock-model"),
+        "state metadata should include effective model metadata: {}",
+        state_metadata.payload_json
+    );
+
+    let requests = server
+        .received_requests()
+        .await
+        .context("failed to fetch mock Responses API requests")?;
+    let response_request_bodies = requests
+        .into_iter()
+        .filter(|request| request.method == "POST" && request.url.path().ends_with("/responses"))
+        .map(|request| request.body_json::<serde_json::Value>())
+        .collect::<Result<Vec<_>, _>>()
+        .context("Responses API request body should be JSON")?;
+    assert_eq!(response_request_bodies.len(), 2);
+    let second_body = serde_json::to_string(&response_request_bodies[1])?;
+    assert!(
+        second_body.contains(&format!("create stateless thread {test_id}")),
+        "second node model request should include first turn user input: {second_body}"
+    );
+    assert!(
+        second_body.contains("created thread completed"),
+        "second node model request should include first turn assistant output: {second_body}"
+    );
+    assert!(
+        second_body.contains(&format!("resume created stateless thread {test_id}")),
+        "second node model request should include second turn user input: {second_body}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires CODEX_CLOUD_STATE_MYSQL_URL pointing at an isolated MySQL test database"]
+async fn request_run_executes_and_resumes_real_turn_across_mysql_app_server_nodes() -> Result<()> {
+    let database_url = std::env::var(MYSQL_URL_ENV_VAR)
+        .context("CODEX_CLOUD_STATE_MYSQL_URL must be set to run this ignored test")?;
+    let server = create_mock_responses_server_sequence(vec![
+        create_final_assistant_message_sse_response("first node completed")?,
+        create_final_assistant_message_sse_response("second node resumed")?,
+    ])
+    .await;
+    let first_codex_home = TempDir::new()?;
+    let second_codex_home = TempDir::new()?;
+    create_config_toml(first_codex_home.path(), &server.uri())?;
+    create_config_toml(second_codex_home.path(), &server.uri())?;
+    let env = [(MYSQL_URL_ENV_VAR, Some(database_url.as_str()))];
+    let test_id = unique_test_id();
+
+    let (thread_id, first_request_id) = {
+        let mut first_node = TestAppServer::new_with_env(first_codex_home.path(), &env).await?;
+        first_node.initialize().await?;
+        let thread_id = start_real_thread(&mut first_node).await?;
+        let first_run = run_real_request(
+            &mut first_node,
+            &thread_id,
+            &format!("first stateless turn {test_id}"),
+            &format!("idem-{test_id}-1"),
+        )
+        .await?;
+        let first_turn_id = first_run
+            .request
+            .turn_id
+            .clone()
+            .expect("request/run should start a real turn");
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            first_node.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+        let first_read =
+            wait_for_request_status(&mut first_node, &first_run.request.request_id).await?;
+        assert_eq!(first_read.request.status, RequestStatus::Completed);
+        assert_eq!(
+            first_read.request.turn_id.as_deref(),
+            Some(first_turn_id.as_str())
+        );
+        (thread_id, first_run.request.request_id)
+    };
+
+    let mut second_node = TestAppServer::new_with_env(second_codex_home.path(), &env).await?;
+    second_node.initialize().await?;
+    let second_run = run_real_request(
+        &mut second_node,
+        &thread_id,
+        &format!("second stateless turn {test_id}"),
+        &format!("idem-{test_id}-2"),
+    )
+    .await?;
+    assert_ne!(second_run.request.request_id, first_request_id);
+    assert!(
+        second_run.request.turn_id.is_some(),
+        "second node should resume the cloud thread and start a real turn"
+    );
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        second_node.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    let second_read =
+        wait_for_request_status(&mut second_node, &second_run.request.request_id).await?;
+    assert_eq!(second_read.request.status, RequestStatus::Completed);
+    let requests = server
+        .received_requests()
+        .await
+        .context("failed to fetch mock Responses API requests")?;
+    let response_request_bodies = requests
+        .into_iter()
+        .filter(|request| request.method == "POST" && request.url.path().ends_with("/responses"))
+        .map(|request| request.body_json::<serde_json::Value>())
+        .collect::<Result<Vec<_>, _>>()
+        .context("Responses API request body should be JSON")?;
+    assert_eq!(response_request_bodies.len(), 2);
+    let second_body = serde_json::to_string(&response_request_bodies[1])?;
+    assert!(
+        second_body.contains(&format!("first stateless turn {test_id}")),
+        "second node model request should include first turn user input: {second_body}"
+    );
+    assert!(
+        second_body.contains("first node completed"),
+        "second node model request should include first turn assistant output: {second_body}"
+    );
+    assert!(
+        second_body.contains(&format!("second stateless turn {test_id}")),
+        "second node model request should include second turn user input: {second_body}"
+    );
+
+    Ok(())
+}
 
 #[tokio::test]
 #[ignore = "requires CODEX_CLOUD_STATE_MYSQL_URL pointing at an isolated MySQL test database"]
@@ -45,7 +290,7 @@ async fn request_run_persists_to_mysql_across_app_server_restart() -> Result<()>
             .send_raw_request(
                 "request/run",
                 Some(serde_json::json!({
-                    "threadId": format!("thread-{test_id}"),
+                    "createThread": true,
                     "input": format!("sha256:{test_id}"),
                     "idempotencyKey": format!("idem-{test_id}"),
                 })),
@@ -74,10 +319,15 @@ async fn request_run_persists_to_mysql_across_app_server_restart() -> Result<()>
 
     assert_eq!(read_response.request.status, RequestStatus::Running);
     assert_eq!(
-        read_response.latest_event_cursor,
-        run_response.request.latest_event_cursor
+        read_response.request.request_id,
+        run_response.request.request_id
     );
-    assert_eq!(read_response.request, run_response.request);
+    assert_eq!(read_response.request.thread_id, run_response.thread_id);
+    assert_eq!(read_response.request.turn_id, run_response.request.turn_id);
+    assert!(
+        read_response.latest_event_cursor >= run_response.request.latest_event_cursor,
+        "turn notifications may advance the event cursor after request/run returns"
+    );
 
     Ok(())
 }
@@ -105,7 +355,7 @@ async fn request_and_thread_operations_reject_different_client_after_app_server_
             .send_raw_request(
                 "request/run",
                 Some(serde_json::json!({
-                    "threadId": format!("thread-{test_id}"),
+                    "createThread": true,
                     "input": format!("sha256:{test_id}"),
                     "idempotencyKey": format!("idem-{test_id}"),
                 })),
@@ -255,7 +505,7 @@ async fn request_cancel_and_events_continue_after_app_server_restart_with_mysql(
             .send_raw_request(
                 "request/run",
                 Some(serde_json::json!({
-                    "threadId": format!("thread-{test_id}"),
+                    "createThread": true,
                     "input": format!("sha256:{test_id}"),
                     "idempotencyKey": format!("idem-{test_id}"),
                 })),
@@ -299,11 +549,7 @@ async fn request_cancel_and_events_continue_after_app_server_restart_with_mysql(
 
     assert_eq!(cancel_response.request.status, RequestStatus::Cancelled);
     assert_eq!(
-        events_response
-            .data
-            .iter()
-            .map(|event| event.event_type.as_str())
-            .collect::<Vec<_>>(),
+        request_event_types(&events_response),
         vec!["request/queued", "request/running", "request/cancelled"]
     );
     assert_eq!(
@@ -332,7 +578,7 @@ async fn request_events_cursor_pagination_survives_app_server_restart_with_mysql
             .send_raw_request(
                 "request/run",
                 Some(serde_json::json!({
-                    "threadId": format!("thread-{test_id}"),
+                    "createThread": true,
                     "input": format!("sha256:{test_id}"),
                     "idempotencyKey": format!("idem-{test_id}"),
                 })),
@@ -386,6 +632,13 @@ async fn request_events_cursor_pagination_survives_app_server_restart_with_mysql
         /*limit*/ 1,
     )
     .await?;
+    let fourth_page = list_events_page(
+        &mut events_mcp,
+        &run_response.request.request_id,
+        third_page.next_cursor,
+        /*limit*/ 1,
+    )
+    .await?;
 
     assert_eq!(
         first_page
@@ -411,9 +664,18 @@ async fn request_events_cursor_pagination_survives_app_server_restart_with_mysql
             .iter()
             .map(|event| (event.sequence, event.event_type.as_str()))
             .collect::<Vec<_>>(),
-        vec![(3, "request/cancelled")]
+        vec![(3, "notification/turn/started")]
     );
-    assert_eq!(third_page.next_cursor, None);
+    assert_eq!(third_page.next_cursor, Some(3));
+    assert_eq!(
+        fourth_page
+            .data
+            .iter()
+            .map(|event| (event.sequence, event.event_type.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(4, "request/cancelled")]
+    );
+    assert_eq!(fourth_page.next_cursor, None);
 
     Ok(())
 }
@@ -428,7 +690,6 @@ async fn request_run_idempotency_survives_app_server_restart_with_mysql() -> Res
     create_config_toml(codex_home.path(), &server.uri())?;
     let env = [(MYSQL_URL_ENV_VAR, Some(database_url.as_str()))];
     let test_id = unique_test_id();
-    let thread_id = format!("thread-{test_id}");
     let input = format!("sha256:{test_id}");
     let idempotency_key = format!("idem-{test_id}");
 
@@ -439,9 +700,9 @@ async fn request_run_idempotency_survives_app_server_restart_with_mysql() -> Res
             .send_raw_request(
                 "request/run",
                 Some(serde_json::json!({
-                    "threadId": thread_id,
-                    "input": input,
-                    "idempotencyKey": idempotency_key,
+                    "createThread": true,
+                    "input": input.clone(),
+                    "idempotencyKey": idempotency_key.clone(),
                 })),
             )
             .await?;
@@ -450,6 +711,7 @@ async fn request_run_idempotency_survives_app_server_restart_with_mysql() -> Res
             .await?;
         to_response::<RequestRunResponse>(response)?
     };
+    let thread_id = first_run.thread_id.clone();
 
     let mut restarted_mcp = TestAppServer::new_with_env(codex_home.path(), &env).await?;
     restarted_mcp.initialize().await?;
@@ -481,7 +743,22 @@ async fn request_run_idempotency_survives_app_server_restart_with_mysql() -> Res
         .read_stream_until_error_message(RequestId::Integer(conflict_request_id))
         .await?;
 
-    assert_eq!(replay_response, first_run);
+    assert_eq!(
+        replay_response.request.request_id,
+        first_run.request.request_id
+    );
+    assert_eq!(
+        replay_response.request.thread_id,
+        first_run.request.thread_id
+    );
+    assert_eq!(replay_response.request.turn_id, first_run.request.turn_id);
+    assert_eq!(replay_response.request.status, first_run.request.status);
+    assert!(
+        replay_response.request.latest_event_cursor >= first_run.request.latest_event_cursor,
+        "turn notifications may advance the event cursor after the initial idempotent response"
+    );
+    assert_eq!(replay_response.thread_id, first_run.thread_id);
+    assert_eq!(replay_response.writer_lease, first_run.writer_lease);
     assert_eq!(conflict.error.code, INVALID_PARAMS_ERROR_CODE);
     assert!(
         conflict
@@ -508,7 +785,11 @@ async fn request_run_concurrent_app_servers_initialize_events_once_with_mysql() 
     create_config_toml(events_codex_home.path(), &server.uri())?;
     let env = [(MYSQL_URL_ENV_VAR, Some(database_url.as_str()))];
     let test_id = unique_test_id();
-    let thread_id = format!("thread-{test_id}");
+    let thread_id = {
+        let mut mcp = TestAppServer::new_with_env(first_codex_home.path(), &env).await?;
+        mcp.initialize().await?;
+        start_real_thread(&mut mcp).await?
+    };
     let input = format!("sha256:{test_id}");
     let idempotency_key = format!("idem-{test_id}");
 
@@ -567,11 +848,7 @@ async fn request_run_concurrent_app_servers_initialize_events_once_with_mysql() 
         first_response.request.request_id
     );
     assert_eq!(
-        events_response
-            .data
-            .iter()
-            .map(|event| event.event_type.as_str())
-            .collect::<Vec<_>>(),
+        request_event_types(&events_response),
         vec!["request/queued", "request/running"]
     );
 
@@ -593,7 +870,11 @@ async fn request_run_concurrent_app_servers_conflicting_input_keeps_single_initi
     create_config_toml(events_codex_home.path(), &server.uri())?;
     let env = [(MYSQL_URL_ENV_VAR, Some(database_url.as_str()))];
     let test_id = unique_test_id();
-    let thread_id = format!("thread-{test_id}");
+    let thread_id = {
+        let mut mcp = TestAppServer::new_with_env(first_codex_home.path(), &env).await?;
+        mcp.initialize().await?;
+        start_real_thread(&mut mcp).await?
+    };
     let idempotency_key = format!("idem-{test_id}");
 
     let first_run = async {
@@ -669,11 +950,7 @@ async fn request_run_concurrent_app_servers_conflicting_input_keeps_single_initi
         errors[0]
     );
     assert_eq!(
-        events_response
-            .data
-            .iter()
-            .map(|event| event.event_type.as_str())
-            .collect::<Vec<_>>(),
+        request_event_types(&events_response),
         vec!["request/queued", "request/running"]
     );
 
@@ -699,7 +976,7 @@ async fn request_terminal_completion_survives_cancel_after_app_server_restart_wi
             .send_raw_request(
                 "request/run",
                 Some(serde_json::json!({
-                    "threadId": format!("thread-{test_id}"),
+                    "createThread": true,
                     "input": format!("sha256:{test_id}"),
                     "idempotencyKey": format!("idem-{test_id}"),
                 })),
@@ -756,11 +1033,7 @@ async fn request_terminal_completion_survives_cancel_after_app_server_restart_wi
 
     assert_eq!(cancel_response.request.status, RequestStatus::Completed);
     assert_eq!(
-        events_response
-            .data
-            .iter()
-            .map(|event| event.event_type.as_str())
-            .collect::<Vec<_>>(),
+        request_event_types(&events_response),
         vec!["request/queued", "request/running", "request/completed"]
     );
 
@@ -784,19 +1057,13 @@ async fn runtime_write_denied_releases_writer_lease_for_queued_request_after_app
     create_config_toml(read_codex_home.path(), &server.uri())?;
     let env = [(MYSQL_URL_ENV_VAR, Some(database_url.as_str()))];
     let test_id = unique_test_id();
-    let thread_id = format!("thread-{test_id}");
     let first_params = serde_json::json!({
-        "threadId": thread_id,
+        "createThread": true,
         "input": format!("sha256:{test_id}:first"),
         "idempotencyKey": format!("idem-{test_id}-1"),
     });
-    let second_params = serde_json::json!({
-        "threadId": thread_id,
-        "input": format!("sha256:{test_id}:second"),
-        "idempotencyKey": format!("idem-{test_id}-2"),
-    });
 
-    let (first_run_response, queued_response) = {
+    let (first_run_response, queued_response, second_params) = {
         let mut mcp = TestAppServer::new_with_env(run_codex_home.path(), &env).await?;
         mcp.initialize().await?;
         let first_request_id = mcp
@@ -806,6 +1073,11 @@ async fn runtime_write_denied_releases_writer_lease_for_queued_request_after_app
             .read_stream_until_response_message(RequestId::Integer(first_request_id))
             .await?;
         let first_response = to_response::<RequestRunResponse>(first_response)?;
+        let second_params = serde_json::json!({
+            "threadId": first_response.thread_id,
+            "input": format!("sha256:{test_id}:second"),
+            "idempotencyKey": format!("idem-{test_id}-2"),
+        });
         let second_request_id = mcp
             .send_raw_request("request/run", Some(second_params.clone()))
             .await?;
@@ -813,7 +1085,7 @@ async fn runtime_write_denied_releases_writer_lease_for_queued_request_after_app
             .read_stream_until_response_message(RequestId::Integer(second_request_id))
             .await?;
         let second_response = to_response::<RequestRunResponse>(second_response)?;
-        (first_response, second_response)
+        (first_response, second_response, second_params)
     };
 
     assert_eq!(first_run_response.request.status, RequestStatus::Running);
@@ -867,14 +1139,13 @@ async fn runtime_write_denied_releases_writer_lease_for_queued_request_after_app
     )
     .await?;
 
-    assert_eq!(
-        events_response
-            .data
-            .iter()
-            .map(|event| event.event_type.as_str())
-            .collect::<Vec<_>>(),
-        vec!["request/queued", "request/running", "request/lease_lost"]
-    );
+    let event_types = events_response
+        .data
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect::<Vec<_>>();
+    assert!(event_types.starts_with(&["request/queued", "request/running"]));
+    assert_eq!(event_types.last(), Some(&"request/lease_lost"));
 
     Ok(())
 }
@@ -896,19 +1167,13 @@ async fn owner_lease_timeout_releases_writer_lease_for_queued_request_after_app_
     create_config_toml(read_codex_home.path(), &server.uri())?;
     let env = [(MYSQL_URL_ENV_VAR, Some(database_url.as_str()))];
     let test_id = unique_test_id();
-    let thread_id = format!("thread-{test_id}");
     let first_params = serde_json::json!({
-        "threadId": thread_id,
+        "createThread": true,
         "input": format!("sha256:{test_id}:first"),
         "idempotencyKey": format!("idem-{test_id}-1"),
     });
-    let second_params = serde_json::json!({
-        "threadId": thread_id,
-        "input": format!("sha256:{test_id}:second"),
-        "idempotencyKey": format!("idem-{test_id}-2"),
-    });
 
-    let (first_run_response, queued_response) = {
+    let (first_run_response, queued_response, second_params) = {
         let mut mcp = TestAppServer::new_with_env(run_codex_home.path(), &env).await?;
         mcp.initialize().await?;
         let first_request_id = mcp
@@ -918,6 +1183,11 @@ async fn owner_lease_timeout_releases_writer_lease_for_queued_request_after_app_
             .read_stream_until_response_message(RequestId::Integer(first_request_id))
             .await?;
         let first_response = to_response::<RequestRunResponse>(first_response)?;
+        let second_params = serde_json::json!({
+            "threadId": first_response.thread_id,
+            "input": format!("sha256:{test_id}:second"),
+            "idempotencyKey": format!("idem-{test_id}-2"),
+        });
         let second_request_id = mcp
             .send_raw_request("request/run", Some(second_params.clone()))
             .await?;
@@ -925,7 +1195,7 @@ async fn owner_lease_timeout_releases_writer_lease_for_queued_request_after_app_
             .read_stream_until_response_message(RequestId::Integer(second_request_id))
             .await?;
         let second_response = to_response::<RequestRunResponse>(second_response)?;
-        (first_response, second_response)
+        (first_response, second_response, second_params)
     };
 
     assert_eq!(first_run_response.request.status, RequestStatus::Running);
@@ -982,18 +1252,121 @@ async fn owner_lease_timeout_releases_writer_lease_for_queued_request_after_app_
     )
     .await?;
 
+    let event_types = events_response
+        .data
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect::<Vec<_>>();
+    assert!(event_types.starts_with(&["request/queued", "request/running"]));
+    assert_eq!(event_types.last(), Some(&"request/owner_timed_out"));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires CODEX_CLOUD_STATE_MYSQL_URL pointing at an isolated MySQL test database"]
+async fn expired_writer_lease_blocks_stale_completed_terminal_and_next_node_acquires_with_mysql()
+-> Result<()> {
+    let database_url = std::env::var(MYSQL_URL_ENV_VAR)
+        .context("CODEX_CLOUD_STATE_MYSQL_URL must be set to run this ignored test")?;
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let stale_codex_home = TempDir::new()?;
+    let next_codex_home = TempDir::new()?;
+    let read_codex_home = TempDir::new()?;
+    create_config_toml(stale_codex_home.path(), &server.uri())?;
+    create_config_toml(next_codex_home.path(), &server.uri())?;
+    create_config_toml(read_codex_home.path(), &server.uri())?;
+    let env = [(MYSQL_URL_ENV_VAR, Some(database_url.as_str()))];
+    let test_id = unique_test_id();
+    let first_params = serde_json::json!({
+        "createThread": true,
+        "input": format!("sha256:{test_id}:first"),
+        "idempotencyKey": format!("idem-{test_id}-1"),
+    });
+
+    let (first_run_response, queued_response, second_params) = {
+        let mut mcp = TestAppServer::new_with_env(stale_codex_home.path(), &env).await?;
+        mcp.initialize().await?;
+        let first_request_id = mcp
+            .send_raw_request("request/run", Some(first_params.clone()))
+            .await?;
+        let first_response = mcp
+            .read_stream_until_response_message(RequestId::Integer(first_request_id))
+            .await?;
+        let first_response = to_response::<RequestRunResponse>(first_response)?;
+        let second_params = serde_json::json!({
+            "threadId": first_response.thread_id.clone(),
+            "input": format!("sha256:{test_id}:second"),
+            "idempotencyKey": format!("idem-{test_id}-2"),
+        });
+        let second_request_id = mcp
+            .send_raw_request("request/run", Some(second_params.clone()))
+            .await?;
+        let second_response = mcp
+            .read_stream_until_response_message(RequestId::Integer(second_request_id))
+            .await?;
+        let second_response = to_response::<RequestRunResponse>(second_response)?;
+        (first_response, second_response, second_params)
+    };
+
+    assert_eq!(first_run_response.request.status, RequestStatus::Running);
+    assert_eq!(queued_response.request.status, RequestStatus::Queued);
+
+    expire_writer_lease(&database_url, &first_run_response.request.request_id).await?;
+
+    let mut stale_mcp = TestAppServer::new_with_env(stale_codex_home.path(), &env).await?;
+    stale_mcp.initialize().await?;
+    let terminal_request_id = stale_mcp
+        .send_raw_request(
+            "request/terminal",
+            Some(serde_json::json!({
+                "requestId": first_run_response.request.request_id.clone(),
+                "signal": "completed",
+                "payloadInline": r#"{"source":"stale-owner"}"#,
+            })),
+        )
+        .await?;
+    let terminal_response = stale_mcp
+        .read_stream_until_response_message(RequestId::Integer(terminal_request_id))
+        .await?;
+    let terminal_response = to_response::<RequestTerminalResponse>(terminal_response)?;
+
+    assert_eq!(terminal_response.request.status, RequestStatus::LeaseLost);
+
+    let mut next_mcp = TestAppServer::new_with_env(next_codex_home.path(), &env).await?;
+    next_mcp.initialize().await?;
+    let replay_request_id = next_mcp
+        .send_raw_request("request/run", Some(second_params))
+        .await?;
+    let replay_response = next_mcp
+        .read_stream_until_response_message(RequestId::Integer(replay_request_id))
+        .await?;
+    let replay_response = to_response::<RequestRunResponse>(replay_response)?;
+
     assert_eq!(
-        events_response
-            .data
-            .iter()
-            .map(|event| event.event_type.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            "request/queued",
-            "request/running",
-            "request/owner_timed_out"
-        ]
+        replay_response.request.request_id,
+        queued_response.request.request_id
     );
+    assert_eq!(replay_response.request.status, RequestStatus::Running);
+    assert!(replay_response.writer_lease.is_some());
+
+    let mut read_mcp = TestAppServer::new_with_env(read_codex_home.path(), &env).await?;
+    read_mcp.initialize().await?;
+    let events_response = list_events_page(
+        &mut read_mcp,
+        &first_run_response.request.request_id,
+        /*cursor*/ None,
+        /*limit*/ 10,
+    )
+    .await?;
+
+    let event_types = events_response
+        .data
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect::<Vec<_>>();
+    assert!(event_types.starts_with(&["request/queued", "request/running"]));
+    assert_eq!(event_types.last(), Some(&"request/lease_lost"));
 
     Ok(())
 }
@@ -1016,7 +1389,7 @@ async fn request_terminal_rejects_invalid_payload_without_state_change_with_mysq
             .send_raw_request(
                 "request/run",
                 Some(serde_json::json!({
-                    "threadId": format!("thread-{test_id}"),
+                    "createThread": true,
                     "input": format!("sha256:{test_id}"),
                     "idempotencyKey": format!("idem-{test_id}"),
                 })),
@@ -1078,11 +1451,7 @@ async fn request_terminal_rejects_invalid_payload_without_state_change_with_mysq
 
     assert_eq!(read_response.request.status, RequestStatus::Running);
     assert_eq!(
-        events_response
-            .data
-            .iter()
-            .map(|event| event.event_type.as_str())
-            .collect::<Vec<_>>(),
+        request_event_types(&events_response),
         vec!["request/queued", "request/running"]
     );
 
@@ -1114,7 +1483,7 @@ async fn request_terminal_concurrent_app_servers_append_one_terminal_event_with_
             .send_raw_request(
                 "request/run",
                 Some(serde_json::json!({
-                    "threadId": format!("thread-{test_id}"),
+                    "createThread": true,
                     "input": format!("sha256:{test_id}"),
                     "idempotencyKey": format!("idem-{test_id}"),
                 })),
@@ -1196,9 +1565,10 @@ async fn request_terminal_concurrent_app_servers_append_one_terminal_event_with_
             .count(),
         1
     );
-    assert_eq!(event_types.len(), 3);
-    assert_eq!(event_types[0], "request/queued");
-    assert_eq!(event_types[1], "request/running");
+    let request_event_types = request_event_types(&events_response);
+    assert_eq!(request_event_types.len(), 3);
+    assert_eq!(request_event_types[0], "request/queued");
+    assert_eq!(request_event_types[1], "request/running");
 
     Ok(())
 }
@@ -1218,7 +1588,6 @@ async fn thread_append_with_lease_uses_request_run_lease_after_app_server_restar
     create_config_toml(replay_codex_home.path(), &server.uri())?;
     let env = [(MYSQL_URL_ENV_VAR, Some(database_url.as_str()))];
     let test_id = unique_test_id();
-    let thread_id = format!("thread-{test_id}");
     let append_idempotency_key = format!("append-{test_id}");
 
     let run_response = {
@@ -1228,7 +1597,7 @@ async fn thread_append_with_lease_uses_request_run_lease_after_app_server_restar
             .send_raw_request(
                 "request/run",
                 Some(serde_json::json!({
-                    "threadId": thread_id,
+                    "createThread": true,
                     "input": format!("sha256:{test_id}"),
                     "idempotencyKey": format!("idem-{test_id}"),
                 })),
@@ -1365,7 +1734,6 @@ async fn thread_append_with_stale_expected_version_fails_after_app_server_restar
     create_config_toml(stale_append_codex_home.path(), &server.uri())?;
     let env = [(MYSQL_URL_ENV_VAR, Some(database_url.as_str()))];
     let test_id = unique_test_id();
-    let thread_id = format!("thread-{test_id}");
 
     let run_response = {
         let mut mcp = TestAppServer::new_with_env(run_codex_home.path(), &env).await?;
@@ -1374,7 +1742,7 @@ async fn thread_append_with_stale_expected_version_fails_after_app_server_restar
             .send_raw_request(
                 "request/run",
                 Some(serde_json::json!({
-                    "threadId": thread_id,
+                    "createThread": true,
                     "input": format!("sha256:{test_id}"),
                     "idempotencyKey": format!("idem-{test_id}"),
                 })),
@@ -1473,7 +1841,6 @@ async fn thread_append_idempotency_key_is_scoped_to_original_request_after_app_s
     create_config_toml(conflict_append_codex_home.path(), &server.uri())?;
     let env = [(MYSQL_URL_ENV_VAR, Some(database_url.as_str()))];
     let test_id = unique_test_id();
-    let thread_id = format!("thread-{test_id}");
     let append_idempotency_key = format!("append-{test_id}");
 
     let first_run_response = {
@@ -1483,7 +1850,7 @@ async fn thread_append_idempotency_key_is_scoped_to_original_request_after_app_s
             .send_raw_request(
                 "request/run",
                 Some(serde_json::json!({
-                    "threadId": thread_id,
+                    "createThread": true,
                     "input": format!("sha256:{test_id}:first"),
                     "idempotencyKey": format!("idem-{test_id}-1"),
                 })),
@@ -1628,6 +1995,117 @@ async fn list_events_page(
     to_response::<RequestEventsListResponse>(response)
 }
 
+fn request_event_types(response: &RequestEventsListResponse) -> Vec<&str> {
+    response
+        .data
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .filter(|event_type| event_type.starts_with("request/"))
+        .collect()
+}
+
+async fn start_real_thread(mcp: &mut TestAppServer) -> Result<String> {
+    let request_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(response)?;
+    Ok(thread.id)
+}
+
+async fn run_new_thread_request(
+    mcp: &mut TestAppServer,
+    input: &str,
+    idempotency_key: &str,
+) -> Result<RequestRunResponse> {
+    let request_id = mcp
+        .send_raw_request(
+            "request/run",
+            Some(serde_json::json!({
+                "createThread": true,
+                "input": input,
+                "idempotencyKey": idempotency_key,
+            })),
+        )
+        .await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let response = to_response::<RequestRunResponse>(response)?;
+    assert_eq!(response.request.status, RequestStatus::Running);
+    assert!(
+        response.writer_lease.is_some(),
+        "running request should include a writer lease"
+    );
+    Ok(response)
+}
+
+async fn run_real_request(
+    mcp: &mut TestAppServer,
+    thread_id: &str,
+    input: &str,
+    idempotency_key: &str,
+) -> Result<RequestRunResponse> {
+    let request_id = mcp
+        .send_raw_request(
+            "request/run",
+            Some(serde_json::json!({
+                "threadId": thread_id,
+                "input": input,
+                "idempotencyKey": idempotency_key,
+            })),
+        )
+        .await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let response = to_response::<RequestRunResponse>(response)?;
+    assert_eq!(response.request.status, RequestStatus::Running);
+    assert!(
+        response.writer_lease.is_some(),
+        "running request should include a writer lease"
+    );
+    Ok(response)
+}
+
+async fn wait_for_request_status(
+    mcp: &mut TestAppServer,
+    request_id: &str,
+) -> Result<RequestReadResponse> {
+    let deadline = tokio::time::Instant::now() + DEFAULT_READ_TIMEOUT;
+    loop {
+        let read_request_id = mcp
+            .send_raw_request(
+                "request/read",
+                Some(serde_json::json!({
+                    "requestId": request_id,
+                })),
+            )
+            .await?;
+        let response = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(read_request_id)),
+        )
+        .await??;
+        let response = to_response::<RequestReadResponse>(response)?;
+        if response.request.status.is_terminal() || tokio::time::Instant::now() >= deadline {
+            return Ok(response);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 enum RequestRunResult {
     Response(RequestRunResponse),
     Error(JSONRPCError),
@@ -1684,6 +2162,17 @@ async fn initialize_as(mcp: &mut TestAppServer, client_name: &str) -> Result<()>
     let JSONRPCMessage::Response(_) = initialized else {
         anyhow::bail!("expected initialize response, got {initialized:?}");
     };
+    Ok(())
+}
+
+async fn expire_writer_lease(database_url: &str, request_id: &str) -> Result<()> {
+    let store = MysqlCloudStateStore::from_database_url(database_url)
+        .await
+        .context("connect to MySQL test database")?;
+    store
+        .expire_thread_writer_lease_for_testing(request_id)
+        .await
+        .context("expire writer lease")?;
     Ok(())
 }
 

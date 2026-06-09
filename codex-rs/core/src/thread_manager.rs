@@ -707,6 +707,33 @@ impl ThreadManager {
         .await
     }
 
+    pub async fn resume_thread_from_store(
+        &self,
+        config: Config,
+        thread_id: ThreadId,
+        auth_manager: Arc<AuthManager>,
+        parent_trace: Option<W3cTraceContext>,
+    ) -> CodexResult<NewThread> {
+        let stored_thread = self
+            .state
+            .thread_store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: true,
+                include_history: true,
+            })
+            .await
+            .map_err(thread_store_rollout_read_error)?;
+        let initial_history = stored_thread_to_initial_history(stored_thread, None)?;
+        Box::pin(self.resume_thread_with_history(
+            config,
+            initial_history,
+            auth_manager,
+            parent_trace,
+        ))
+        .await
+    }
+
     pub(crate) async fn start_thread_with_user_shell_override_for_tests(
         &self,
         config: Config,

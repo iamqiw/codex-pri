@@ -596,6 +596,33 @@ fn terminal_request_releases_thread_writer_lease_for_next_queued_request() {
 }
 
 #[test]
+fn renew_request_leases_keeps_active_request_running() {
+    let mut store = InMemoryCloudStateStore::default();
+    let request = store
+        .create_request(CreateRequestParams {
+            caller_id: "caller-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            idempotency_key: "idem-1".to_string(),
+            input_hash: "hash-a".to_string(),
+        })
+        .unwrap();
+    store
+        .acquire_thread_writer_lease(&request.request_id, "owner-1")
+        .unwrap();
+
+    assert_eq!(
+        store
+            .renew_request_leases(&request.request_id, "owner-1")
+            .unwrap(),
+        true
+    );
+    assert_eq!(
+        store.read_request(&request.request_id).unwrap().status,
+        RequestStatus::Running
+    );
+}
+
+#[test]
 fn owner_timed_out_request_releases_lease_for_next_queued_request() {
     let mut store = InMemoryCloudStateStore::default();
     let first = store

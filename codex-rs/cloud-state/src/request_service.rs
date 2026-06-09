@@ -19,12 +19,14 @@ use codex_cloud_wrapper_protocol::ThreadItemsListResponse;
 
 use crate::CloudStateError;
 use crate::CloudStateStore;
+use crate::ConfigSnapshotRecord;
 use crate::CreateRequestParams;
 use crate::EventAppendParams;
 use crate::EventsPage;
 use crate::InMemoryCloudStateStore;
 use crate::LeaseAcquireOutcome;
 use crate::MysqlCloudStateStore;
+use crate::StateMetadataRecord;
 
 const REQUEST_EVENTS_LIST_DEFAULT_LIMIT: usize = 100;
 const REQUEST_EVENTS_LIST_MAX_LIMIT: usize = 100;
@@ -177,6 +179,30 @@ where
         })
     }
 
+    pub async fn set_turn_id(
+        &mut self,
+        caller_id: &str,
+        request_id: &str,
+        turn_id: &str,
+    ) -> Result<crate::RequestRecord, CloudStateError> {
+        self.read_request_for_caller(caller_id, request_id).await?;
+        self.store.set_request_turn_id(request_id, turn_id).await
+    }
+
+    pub async fn renew_request_leases(
+        &mut self,
+        request_id: &str,
+        owner_instance_id: &str,
+    ) -> Result<bool, CloudStateError> {
+        self.store
+            .renew_request_leases(request_id, owner_instance_id)
+            .await
+    }
+
+    pub async fn expire_owner_leases(&mut self) -> Result<usize, CloudStateError> {
+        self.store.expire_owner_leases().await
+    }
+
     pub async fn cancel(
         &mut self,
         caller_id: &str,
@@ -265,6 +291,40 @@ where
         .await
     }
 
+    pub async fn terminal_for_turn_id(
+        &mut self,
+        turn_id: &str,
+        signal: TerminalSignal,
+        payload_inline: Option<String>,
+    ) -> Result<RequestTerminalResponse, CloudStateError> {
+        let request = self.store.read_request_by_turn_id(turn_id).await?;
+        self.terminal_signal(
+            &request.caller_id,
+            &request.request_id,
+            signal,
+            payload_inline,
+        )
+        .await
+    }
+
+    pub async fn append_event_for_turn_id(
+        &mut self,
+        turn_id: &str,
+        event_type: String,
+        payload_inline: String,
+    ) -> Result<RequestEvent, CloudStateError> {
+        let request = self.store.read_request_by_turn_id(turn_id).await?;
+        let event = self
+            .store
+            .append_request_event(EventAppendParams {
+                request_id: request.request_id,
+                event_type,
+                payload_inline,
+            })
+            .await?;
+        Ok(event_record_into_protocol(event))
+    }
+
     pub async fn events_list(
         &self,
         caller_id: &str,
@@ -281,6 +341,24 @@ where
             )
             .await?;
         Ok(page.into_protocol())
+    }
+
+    pub async fn persist_request_context(
+        &mut self,
+        caller_id: &str,
+        config_snapshot: ConfigSnapshotRecord,
+        state_metadata: StateMetadataRecord,
+    ) -> Result<(), CloudStateError> {
+        let request = self
+            .read_request_for_caller(caller_id, &config_snapshot.request_id)
+            .await?;
+        if request.thread_id != config_snapshot.thread_id
+            || request.thread_id != state_metadata.thread_id
+        {
+            return Err(CloudStateError::ThreadMismatch);
+        }
+        self.store.persist_config_snapshot(config_snapshot).await?;
+        self.store.upsert_state_metadata(state_metadata).await
     }
 
     fn resolve_thread_id(
@@ -393,6 +471,44 @@ impl CloudRequestServiceRuntime {
         }
     }
 
+    pub async fn set_turn_id(
+        &mut self,
+        caller_id: &str,
+        request_id: &str,
+        turn_id: &str,
+    ) -> Result<crate::RequestRecord, CloudStateError> {
+        match self {
+            Self::InMemory(service) => service.set_turn_id(caller_id, request_id, turn_id).await,
+            Self::Mysql(service) => service.set_turn_id(caller_id, request_id, turn_id).await,
+        }
+    }
+
+    pub async fn renew_request_leases(
+        &mut self,
+        request_id: &str,
+        owner_instance_id: &str,
+    ) -> Result<bool, CloudStateError> {
+        match self {
+            Self::InMemory(service) => {
+                service
+                    .renew_request_leases(request_id, owner_instance_id)
+                    .await
+            }
+            Self::Mysql(service) => {
+                service
+                    .renew_request_leases(request_id, owner_instance_id)
+                    .await
+            }
+        }
+    }
+
+    pub async fn expire_owner_leases(&mut self) -> Result<usize, CloudStateError> {
+        match self {
+            Self::InMemory(service) => service.expire_owner_leases().await,
+            Self::Mysql(service) => service.expire_owner_leases().await,
+        }
+    }
+
     pub async fn append_thread_items_with_lease(
         &mut self,
         caller_id: &str,
@@ -466,6 +582,46 @@ impl CloudRequestServiceRuntime {
         }
     }
 
+    pub async fn terminal_for_turn_id(
+        &mut self,
+        turn_id: &str,
+        signal: TerminalSignal,
+        payload_inline: Option<String>,
+    ) -> Result<RequestTerminalResponse, CloudStateError> {
+        match self {
+            Self::InMemory(service) => {
+                service
+                    .terminal_for_turn_id(turn_id, signal, payload_inline)
+                    .await
+            }
+            Self::Mysql(service) => {
+                service
+                    .terminal_for_turn_id(turn_id, signal, payload_inline)
+                    .await
+            }
+        }
+    }
+
+    pub async fn append_event_for_turn_id(
+        &mut self,
+        turn_id: &str,
+        event_type: String,
+        payload_inline: String,
+    ) -> Result<RequestEvent, CloudStateError> {
+        match self {
+            Self::InMemory(service) => {
+                service
+                    .append_event_for_turn_id(turn_id, event_type, payload_inline)
+                    .await
+            }
+            Self::Mysql(service) => {
+                service
+                    .append_event_for_turn_id(turn_id, event_type, payload_inline)
+                    .await
+            }
+        }
+    }
+
     pub async fn events_list(
         &self,
         caller_id: &str,
@@ -476,6 +632,26 @@ impl CloudRequestServiceRuntime {
             Self::Mysql(service) => service.events_list(caller_id, params).await,
         }
     }
+
+    pub async fn persist_request_context(
+        &mut self,
+        caller_id: &str,
+        config_snapshot: ConfigSnapshotRecord,
+        state_metadata: StateMetadataRecord,
+    ) -> Result<(), CloudStateError> {
+        match self {
+            Self::InMemory(service) => {
+                service
+                    .persist_request_context(caller_id, config_snapshot, state_metadata)
+                    .await
+            }
+            Self::Mysql(service) => {
+                service
+                    .persist_request_context(caller_id, config_snapshot, state_metadata)
+                    .await
+            }
+        }
+    }
 }
 
 impl EventsPage {
@@ -484,14 +660,18 @@ impl EventsPage {
             data: self
                 .data
                 .into_iter()
-                .map(|event| RequestEvent {
-                    request_id: event.request_id,
-                    sequence: event.sequence,
-                    event_type: event.event_type,
-                    payload_inline: event.payload_inline,
-                })
+                .map(event_record_into_protocol)
                 .collect(),
             next_cursor: self.next_cursor,
         }
+    }
+}
+
+fn event_record_into_protocol(event: crate::EventRecord) -> RequestEvent {
+    RequestEvent {
+        request_id: event.request_id,
+        sequence: event.sequence,
+        event_type: event.event_type,
+        payload_inline: event.payload_inline,
     }
 }

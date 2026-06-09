@@ -2373,7 +2373,11 @@ dependencies = [
 name = "codex-cloud-state"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
+ "chrono",
  "codex-cloud-wrapper-protocol",
+ "codex-protocol",
+ "codex-thread-store",
  "pretty_assertions",
  "serde_json",
  "sqlx",
@@ -2786,6 +2790,7 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "serde_json",
+ "sqlx",
  "supports-color 3.0.2",
  "tempfile",
  "tokio",

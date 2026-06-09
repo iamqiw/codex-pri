@@ -25,6 +25,8 @@ use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::McpServerElicitationAction;
 use codex_app_server_protocol::McpServerElicitationRequestResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::RequestRunParams;
+use codex_app_server_protocol::RequestRunResponse;
 use codex_app_server_protocol::ReviewStartParams;
 use codex_app_server_protocol::ReviewStartResponse;
 use codex_app_server_protocol::ReviewTarget as ApiReviewTarget;
@@ -773,6 +775,96 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             anyhow::anyhow!("failed to initialize in-process app-server client: {err}")
         })?;
 
+    if config.cloud_runtime.enabled
+        && let Some(request_input) = cloud_request_input_from_initial_operation(&initial_operation)
+    {
+        let resume_thread_id = if let Some(ExecCommand::Resume(args)) = command.as_ref() {
+            resolve_resume_thread_id(&client, &config, state_db.as_ref(), args).await?
+        } else {
+            None
+        };
+        let mut request_params = RequestRunParams {
+            thread_id: resume_thread_id,
+            create_thread: Some(true),
+            input: request_input,
+            idempotency_key: Uuid::new_v4().to_string(),
+            cwd: Some(default_cwd.to_string_lossy().to_string()),
+            client_info: Some(format!("codex_exec/{}", env!("CARGO_PKG_VERSION"))),
+        };
+        let response = loop {
+            let response: RequestRunResponse = send_request_with_response(
+                &client,
+                ClientRequest::RequestRun {
+                    request_id: request_ids.next(),
+                    params: request_params.clone(),
+                },
+                "request/run",
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+            if let Some(turn_id) = response.request.turn_id.clone() {
+                break (response, turn_id);
+            }
+            if response.request.status.is_terminal() {
+                return Err(anyhow::anyhow!(
+                    "request/run reached terminal status {:?} before starting a turn",
+                    response.request.status
+                ));
+            }
+            request_params.thread_id = Some(response.thread_id);
+            request_params.create_thread = Some(false);
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        };
+        let (response, task_id) = response;
+        let thread_read: ThreadReadResponse = send_request_with_response(
+            &client,
+            ClientRequest::ThreadRead {
+                request_id: request_ids.next(),
+                params: ThreadReadParams {
+                    thread_id: response.thread_id.clone(),
+                    include_turns: false,
+                },
+            },
+            "thread/read",
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        let session_configured =
+            session_configured_from_thread_read_response(&thread_read, &config)
+                .map_err(anyhow::Error::msg)?;
+        let primary_thread_id_for_span = response.thread_id.clone();
+        exec_span.record("thread.id", primary_thread_id_for_span.as_str());
+        exec_span.record("turn.id", task_id.as_str());
+        event_processor.print_config_summary(&config, &prompt_summary, &session_configured);
+        if !json_mode
+            && let Some(message) =
+                codex_core::config::system_bwrap_warning(config.permissions.permission_profile())
+        {
+            event_processor.process_warning(message);
+        }
+        info!(
+            "Codex initialized with cloud request: {:?}",
+            response.request
+        );
+        let error_seen = process_turn_until_complete(
+            &mut client,
+            event_processor.as_mut(),
+            &mut request_ids,
+            config.ephemeral,
+            primary_thread_id_for_span,
+            task_id,
+        )
+        .await;
+        if let Err(err) = client.shutdown().await {
+            warn!("in-process app-server shutdown failed: {err}");
+        }
+        event_processor.print_final_output();
+        if error_seen {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     // Handle resume subcommand through existing `thread/list` + `thread/resume`
     // APIs so exec no longer reaches into rollout storage directly.
     let (primary_thread_id, fallback_session_configured) = if let Some(ExecCommand::Resume(args)) =
@@ -847,14 +939,6 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 
     info!("Codex initialized with event: {session_configured:?}");
 
-    let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::debug!("Keyboard interrupt");
-            let _ = interrupt_tx.send(());
-        }
-    });
-
     let task_id = match initial_operation {
         InitialOperation::UserTurn {
             items,
@@ -922,12 +1006,44 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     };
     exec_span.record("turn.id", task_id.as_str());
 
-    // Run the loop until the task is complete.
-    // Track whether a fatal error was reported by the server so we can
-    // exit with a non-zero status for automation-friendly signaling.
+    let error_seen = process_turn_until_complete(
+        &mut client,
+        event_processor.as_mut(),
+        &mut request_ids,
+        config.ephemeral,
+        primary_thread_id.to_string(),
+        task_id,
+    )
+    .await;
+
+    if let Err(err) = client.shutdown().await {
+        warn!("in-process app-server shutdown failed: {err}");
+    }
+    event_processor.print_final_output();
+    if error_seen {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+async fn process_turn_until_complete(
+    client: &mut InProcessAppServerClient,
+    event_processor: &mut dyn EventProcessor,
+    request_ids: &mut RequestIdSequencer,
+    thread_ephemeral: bool,
+    primary_thread_id_for_requests: String,
+    task_id: String,
+) -> bool {
     let mut error_seen = false;
     let mut interrupt_channel_open = true;
-    let primary_thread_id_for_requests = primary_thread_id.to_string();
+    let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::debug!("Keyboard interrupt");
+            let _ = interrupt_tx.send(());
+        }
+    });
     loop {
         let server_event = tokio::select! {
             maybe_interrupt = interrupt_rx.recv(), if interrupt_channel_open => {
@@ -936,7 +1052,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     continue;
                 }
                 if let Err(err) = send_request_with_response::<TurnInterruptResponse>(
-                    &client,
+                    client,
                     ClientRequest::TurnInterrupt {
                         request_id: request_ids.next(),
                         params: TurnInterruptParams {
@@ -961,7 +1077,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 
         match server_event {
             InProcessServerEvent::ServerRequest(request) => {
-                handle_server_request(&client, request, &mut error_seen).await;
+                handle_server_request(client, request, &mut error_seen).await;
             }
             InProcessServerEvent::ServerNotification(mut notification) => {
                 if let ServerNotification::Error(payload) = &notification {
@@ -984,9 +1100,9 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 }
 
                 maybe_backfill_turn_completed_items(
-                    config.ephemeral,
-                    &client,
-                    &mut request_ids,
+                    thread_ephemeral,
+                    client,
+                    request_ids,
                     &mut notification,
                 )
                 .await;
@@ -1000,8 +1116,8 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                         CodexStatus::Running => {}
                         CodexStatus::InitiateShutdown => {
                             if let Err(err) = request_shutdown(
-                                &client,
-                                &mut request_ids,
+                                client,
+                                request_ids,
                                 &primary_thread_id_for_requests,
                             )
                             .await
@@ -1020,16 +1136,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             }
         }
     }
-
-    if let Err(err) = client.shutdown().await {
-        warn!("in-process app-server shutdown failed: {err}");
-    }
-    event_processor.print_final_output();
-    if error_seen {
-        std::process::exit(1);
-    }
-
-    Ok(())
+    error_seen
 }
 
 fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
@@ -1089,6 +1196,26 @@ fn thread_resume_params_from_config(config: &Config, thread_id: String) -> Threa
         config: None,
         ..ThreadResumeParams::default()
     }
+}
+
+fn cloud_request_input_from_initial_operation(operation: &InitialOperation) -> Option<String> {
+    let InitialOperation::UserTurn {
+        items,
+        output_schema: None,
+    } = operation
+    else {
+        return None;
+    };
+
+    let mut text_parts = Vec::new();
+    for item in items {
+        match item {
+            UserInput::Text { text, .. } => text_parts.push(text.as_str()),
+            UserInput::Image { .. } | UserInput::LocalImage { .. } => return None,
+            _ => return None,
+        }
+    }
+    Some(text_parts.join("\n\n"))
 }
 
 fn permissions_selection_from_config(config: &Config) -> Option<String> {
@@ -1193,6 +1320,32 @@ fn session_configured_from_thread_resume_response(
         response.active_permission_profile.clone().map(Into::into),
         response.cwd.clone(),
         response.reasoning_effort,
+    )
+}
+
+fn session_configured_from_thread_read_response(
+    response: &ThreadReadResponse,
+    config: &Config,
+) -> Result<SessionConfiguredEvent, String> {
+    session_configured_from_thread_response(
+        &response.thread.session_id,
+        &response.thread.id,
+        response.thread.parent_thread_id.as_deref(),
+        response.thread.thread_source.map(Into::into),
+        response.thread.name.clone(),
+        response.thread.path.clone(),
+        config
+            .model
+            .clone()
+            .unwrap_or_else(|| "unspecified".to_string()),
+        response.thread.model_provider.clone(),
+        config.service_tier.clone(),
+        config.permissions.approval_policy.value(),
+        config.approvals_reviewer,
+        config.permissions.effective_permission_profile(),
+        config.permissions.active_permission_profile(),
+        response.thread.cwd.clone(),
+        config.model_reasoning_effort,
     )
 }
 

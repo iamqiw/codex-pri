@@ -16,6 +16,7 @@ pub(super) fn request_from_row(
         thread_id: row.try_get("thread_id").map_err(storage_error)?,
         idempotency_key: row.try_get("idempotency_key").map_err(storage_error)?,
         input_hash: row.try_get("input_hash").map_err(storage_error)?,
+        turn_id: row.try_get("turn_id").map_err(storage_error)?,
         status: status_from_str(status.as_str())?,
         latest_event_cursor: row.try_get("latest_event_cursor").map_err(storage_error)?,
     })
